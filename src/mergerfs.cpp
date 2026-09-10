@@ -26,6 +26,7 @@
 #include "fs_readahead.hpp"
 #include "fs_umount2.hpp"
 #include "fs_wait_for_mount.hpp"
+#include "health.hpp"
 #include "maintenance_thread.hpp"
 #include "oom.hpp"
 #include "option_parser.hpp"
@@ -360,6 +361,11 @@ _main(int    argc_,
     ::_lazy_umount(cfg.mountpoint);
 
   caps::setup();
+
+  // Runs on libfuse's maintenance thread (roughly once a minute); health::tick
+  // decides for itself whether health.interval has elapsed. Registered before
+  // fuse_main because that is what starts the thread.
+  MaintenanceThread::push_job(&health::tick);
 
   rv = fuse_main(args.argc,
                  args.argv,

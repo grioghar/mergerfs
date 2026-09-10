@@ -17,6 +17,8 @@
 */
 
 #include "branch.hpp"
+
+#include <fnmatch.h>
 #include "num.hpp"
 
 Branch::Branch()
@@ -27,7 +29,9 @@ Branch::Branch()
 Branch::Branch(const Branch &branch_)
   : _minfreespace(branch_._minfreespace),
     mode(branch_.mode),
-    path(branch_.path)
+    path(branch_.path),
+    accept(branch_.accept),
+    reject(branch_.reject)
 {
 }
 
@@ -61,6 +65,21 @@ Branch::to_string(void) const
     {
       rv += ',';
       rv += num::humanize(std::get<u64>(_minfreespace));
+    }
+
+  // Emitted as key=value so the string round-trips through from_string.
+  if(!accept.empty())
+    {
+      rv += ",accept=";
+      for(std::size_t i = 0; i < accept.size(); i++)
+        { if(i) rv += '|'; rv += accept[i]; }
+    }
+
+  if(!reject.empty())
+    {
+      rv += ",reject=";
+      for(std::size_t i = 0; i < reject.size(); i++)
+        { if(i) rv += '|'; rv += reject[i]; }
     }
 
   return rv;
@@ -97,4 +116,38 @@ Branch::ro_or_nc(void) const
 {
   return ((mode == Branch::Mode::RO) ||
           (mode == Branch::Mode::NC));
+}
+
+bool
+Branch::accepts(const std::string &fusepath_) const
+{
+  // FUSE hands paths to mergerfs without a leading '/' (branch.path /
+  // fusepath relies on the right-hand side being relative). Patterns read far
+  // more naturally anchored at the pool root -- "/downloads/*" rather than
+  // "downloads/*" -- so normalise the subject instead of the pattern.
+  std::string subject;
+
+  if(fusepath_.empty() || (fusepath_[0] != '/'))
+    subject = "/" + fusepath_;
+  else
+    subject = fusepath_;
+
+  // reject wins over accept: it is the safety net, and an admin writing both
+  // means "these, except those".
+  for(const auto &pat : reject)
+    {
+      if(::fnmatch(pat.c_str(),subject.c_str(),0) == 0)
+        return false;
+    }
+
+  if(accept.empty())
+    return true;
+
+  for(const auto &pat : accept)
+    {
+      if(::fnmatch(pat.c_str(),subject.c_str(),0) == 0)
+        return true;
+    }
+
+  return false;
 }

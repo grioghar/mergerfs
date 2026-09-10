@@ -56,6 +56,11 @@ Policies::Action::find(const std::string_view name_)
 Policy::CreateImpl*
 Policies::Create::find(const std::string_view name_)
 {
+  // Create-only. Steering reads or metadata actions by free space would make
+  // no sense, so `balance` is deliberately absent from Action and Search.
+  if(name_ == "balance")
+    return &Policies::Create::balance;
+
   IFERT(IFERTC);
 
   return NULL;
@@ -104,6 +109,7 @@ Policy::FF::Create      Policies::Create::ff;
 Policy::LFS::Create     Policies::Create::lfs;
 Policy::LUS::Create     Policies::Create::lus;
 Policy::LUP::Create     Policies::Create::lup;
+Policy::Balance::Create Policies::Create::balance;
 Policy::MFS::Create     Policies::Create::mfs;
 Policy::MSPLFS::Create  Policies::Create::msplfs;
 Policy::MSPLUS::Create  Policies::Create::msplus;

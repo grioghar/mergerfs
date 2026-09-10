@@ -121,7 +121,7 @@ _mkdir(const ugid_t          ugid_,
   if(existingbranches.empty())
     return -ENOENT;
 
-  rv = mkdirPolicy_(branches_,fusedirpath,createbranches);
+  rv = mkdirPolicy_.create_dir(branches_,fusedirpath,createbranches);
   if(rv < 0)
     return rv;
   if(createbranches.empty())

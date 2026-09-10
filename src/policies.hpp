@@ -31,6 +31,7 @@
 #include "policy_lfs.hpp"
 #include "policy_lus.hpp"
 #include "policy_lup.hpp"
+#include "policy_balance.hpp"
 #include "policy_mfs.hpp"
 #include "policy_msplfs.hpp"
 #include "policy_msplus.hpp"
@@ -86,6 +87,7 @@ struct Policies
     static Policy::LFS::Create     lfs;
     static Policy::LUP::Create     lup;
     static Policy::LUS::Create     lus;
+    static Policy::Balance::Create balance;
     static Policy::MFS::Create     mfs;
     static Policy::MSPLFS::Create  msplfs;
     static Policy::MSPLUS::Create  msplus;

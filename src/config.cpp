@@ -73,6 +73,7 @@ Config::Config()
   :
   allow_idmap(true),
   async_read(true),
+  balance(false),
   branches(),
   branches_mount_timeout(0),
   branches_mount_timeout_fail(false),
@@ -194,6 +195,11 @@ Config::Config()
   _map["atomic-o-trunc"]              = &_dummy;
   _map["auto-cache"]                  = &_dummy;
   _map["big-writes"]                  = &_dummy;
+  _map["balance"]                     = &balance;
+  _map["balance.count"]               = &balance_count;
+  _map["balance.gap"]                 = &balance_gap;
+  _map["balance.min-free"]            = &balance_min_free;
+  _map["balance.status"]              = &balance_status;
   _map["branches"]                    = &branches;
   _map["branches-mount-timeout"]      = &branches_mount_timeout;
   _map["branches-mount-timeout-fail"] = &branches_mount_timeout_fail;
@@ -245,6 +251,12 @@ Config::Config()
   _map["gid"]                         = &_gid;
   _map["gid-cache.expire-timeout"]    = &_dummy;
   _map["gid-cache.remove-timeout"]    = &_dummy;
+  _map["health"]                      = &health;
+  _map["health.interval"]             = &health_interval;
+  _map["health.max-pending"]          = &health_max_pending;
+  _map["health.max-realloc"]          = &health_max_realloc;
+  _map["health.max-temp"]             = &health_max_temp;
+  _map["health.status"]               = &health_status;
   _map["handle-killpriv"]             = &handle_killpriv;
   _map["handle-killpriv-v2"]          = &handle_killpriv_v2;
   _map["hard-remove"]                 = &_dummy;

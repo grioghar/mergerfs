@@ -127,7 +127,7 @@ _mknod(const ugid_t          ugid_,
   if(existingbranches.empty())
     return -ENOENT;
 
-  rv = createFunc_(branches_,fusedirpath,createbranches);
+  rv = createFunc_(branches_,fusedirpath,fusepath_,createbranches);
   if(rv < 0)
     return rv;
   if(createbranches.empty())

@@ -4091,6 +4091,174 @@ test_qos_quoted_patterns(void)
   TEST_CHECK(rs2->classify(notbear.s)->name == "b");
 }
 
+// ---------------------------------------------------------------------------
+// Branch accept/reject pattern tests
+// ---------------------------------------------------------------------------
+
+void
+test_branch_no_patterns_accepts_everything()
+{
+  uint64_t global = 0;
+  Branch b(global);
+
+  TEST_CHECK(b.has_filters() == false);
+  TEST_CHECK(b.accepts("/Movies/film.mkv") == true);
+  TEST_CHECK(b.accepts("/downloads/junk.srt") == true);
+}
+
+void
+test_branch_accept_extension_patterns()
+{
+  uint64_t global = 0;
+  Branch b(global);
+
+  b.accept = {"*.mkv","*.mp4"};
+
+  TEST_CHECK(b.has_filters() == true);
+  TEST_CHECK(b.accepts("/Movies/film.mkv") == true);
+  TEST_CHECK(b.accepts("/Movies/film.mp4") == true);
+  TEST_CHECK(b.accepts("/Movies/film.srt") == false);
+  TEST_CHECK(b.accepts("/Movies/film.mkv.part") == false);
+}
+
+void
+test_branch_reject_extension_patterns()
+{
+  uint64_t global = 0;
+  Branch b(global);
+
+  b.reject = {"*.srt","*.nfo"};
+
+  TEST_CHECK(b.accepts("/Movies/film.mkv") == true);
+  TEST_CHECK(b.accepts("/Movies/film.srt") == false);
+  TEST_CHECK(b.accepts("/Movies/film.nfo") == false);
+}
+
+void
+test_branch_reject_wins_over_accept()
+{
+  uint64_t global = 0;
+  Branch b(global);
+
+  b.accept = {"*.mkv"};
+  b.reject = {"*sample*"};
+
+  TEST_CHECK(b.accepts("/Movies/film.mkv")        == true);
+  TEST_CHECK(b.accepts("/Movies/sample.mkv")      == false);
+  TEST_CHECK(b.accepts("/Movies/film-sample.mkv") == false);
+  TEST_CHECK(b.accepts("/Movies/film.srt")        == false);
+}
+
+void
+test_branch_directory_patterns_anchor_at_pool_root()
+{
+  uint64_t global = 0;
+  Branch b(global);
+
+  b.reject = {"/downloads/*","/usenet/*"};
+
+  // FUSE hands mergerfs relative paths; accepts() must anchor them so that
+  // admins can write "/downloads/*" and have it mean the pool root.
+  TEST_CHECK(b.accepts("downloads/wip.mkv")     == false);
+  TEST_CHECK(b.accepts("/downloads/wip.mkv")    == false);
+  TEST_CHECK(b.accepts("downloads/sub/x.mkv")   == false);
+  TEST_CHECK(b.accepts("usenet/part.rar")       == false);
+  TEST_CHECK(b.accepts("Movies/film.mkv")       == true);
+  TEST_CHECK(b.accepts("/Movies/film.mkv")      == true);
+
+  // "downloads" elsewhere in the tree is not the rejected directory.
+  TEST_CHECK(b.accepts("Movies/downloads.mkv")  == true);
+}
+
+void
+test_branch_accept_directory_patterns()
+{
+  uint64_t global = 0;
+  Branch b(global);
+
+  b.accept = {"/Movies/*","/TV/*"};
+
+  TEST_CHECK(b.accepts("Movies/a.mkv")    == true);
+  TEST_CHECK(b.accepts("TV/Show/b.mkv")   == true);
+  TEST_CHECK(b.accepts("downloads/c.mkv") == false);
+  TEST_CHECK(b.accepts("Music/d.flac")    == false);
+}
+
+void
+test_branch_copy_preserves_patterns()
+{
+  uint64_t global = 0;
+  Branch orig(global);
+
+  orig.path   = "/mnt/disk1";
+  orig.accept = {"*.mkv"};
+  orig.reject = {"*sample*"};
+
+  Branch copy(orig);
+
+  TEST_CHECK(copy.accept == orig.accept);
+  TEST_CHECK(copy.reject == orig.reject);
+  TEST_CHECK(copy.accepts("/a.mkv")      == true);
+  TEST_CHECK(copy.accepts("/sample.mkv") == false);
+
+  Branch assigned(global);
+  assigned = orig;
+
+  TEST_CHECK(assigned.accept == orig.accept);
+  TEST_CHECK(assigned.reject == orig.reject);
+}
+
+void
+test_branch_to_string_with_patterns()
+{
+  uint64_t global = 0;
+  Branch b(global);
+
+  b.path = "/mnt/disk1";
+  b.mode = Branch::Mode::RW;
+
+  b.accept = {"*.mkv","*.mp4"};
+  TEST_CHECK(b.to_string() == "/mnt/disk1=RW,accept=*.mkv|*.mp4");
+
+  b.accept.clear();
+  b.reject = {"*.srt"};
+  TEST_CHECK(b.to_string() == "/mnt/disk1=RW,reject=*.srt");
+}
+
+void
+test_branches_parse_patterns()
+{
+  Branches branches;
+
+  TEST_CHECK(branches.from_string("/mnt/a=RW,accept=*.mkv|*.mp4,reject=*sample*:/mnt/b=RO") == 0);
+
+  Branches::Ptr b = branches;
+
+  TEST_CHECK(b->size() == 2);
+
+  TEST_CHECK((*b)[0].path   == "/mnt/a");
+  TEST_CHECK((*b)[0].mode   == Branch::Mode::RW);
+  TEST_CHECK((*b)[0].accept == (std::vector<std::string>{"*.mkv","*.mp4"}));
+  TEST_CHECK((*b)[0].reject == (std::vector<std::string>{"*sample*"}));
+
+  TEST_CHECK((*b)[1].path == "/mnt/b");
+  TEST_CHECK((*b)[1].mode == Branch::Mode::RO);
+  TEST_CHECK((*b)[1].has_filters() == false);
+}
+
+void
+test_branches_parse_patterns_with_minfreespace()
+{
+  Branches branches;
+
+  TEST_CHECK(branches.from_string("/mnt/a=RW,1G,reject=/downloads/*") == 0);
+
+  Branches::Ptr b = branches;
+
+  TEST_CHECK((*b)[0].minfreespace() == (1024ULL*1024*1024));
+  TEST_CHECK((*b)[0].reject == (std::vector<std::string>{"/downloads/*"}));
+}
+
 
 TEST_LIST =
   {
@@ -4109,6 +4277,16 @@ TEST_LIST =
    {"branch_minfreespace_pointer_vs_value",test_branch_minfreespace_pointer_vs_value},
    {"branch_copy_constructor",test_branch_copy_constructor},
    {"branch_copy_assignment",test_branch_copy_assignment},
+   {"branch_no_patterns_accepts_everything",test_branch_no_patterns_accepts_everything},
+   {"branch_accept_extension_patterns",test_branch_accept_extension_patterns},
+   {"branch_reject_extension_patterns",test_branch_reject_extension_patterns},
+   {"branch_reject_wins_over_accept",test_branch_reject_wins_over_accept},
+   {"branch_directory_patterns_anchor_at_pool_root",test_branch_directory_patterns_anchor_at_pool_root},
+   {"branch_accept_directory_patterns",test_branch_accept_directory_patterns},
+   {"branch_copy_preserves_patterns",test_branch_copy_preserves_patterns},
+   {"branch_to_string_with_patterns",test_branch_to_string_with_patterns},
+   {"branches_parse_patterns",test_branches_parse_patterns},
+   {"branches_parse_patterns_with_minfreespace",test_branches_parse_patterns_with_minfreespace},
    {"branches_default_minfreespace",test_branches_default_minfreespace},
    {"branches_per_branch_minfreespace_overrides_default",test_branches_per_branch_minfreespace_overrides_default},
    {"branches_add_end_operator",test_branches_add_end_operator},

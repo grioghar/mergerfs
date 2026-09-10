@@ -115,7 +115,7 @@ _symlink(const ugid_t          ugid_,
   if(existingbranches.empty())
     return -ENOENT;
 
-  rv = createFunc_(branches_,newdirpath,newbranches);
+  rv = createFunc_(branches_,newdirpath,linkpath_,newbranches);
   if(rv < 0)
     return rv;
   if(newbranches.empty())
