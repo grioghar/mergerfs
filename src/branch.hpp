@@ -45,6 +45,18 @@ public:
   Mode mode;
   fs::path path;
 
+  // Per-branch path filters, evaluated at create time against the path
+  // within the pool. Empty accept means "anything not rejected".
+  //
+  // This exists because a create policy cannot filter by file SIZE: at
+  // create() the file is empty and its eventual size is unknown. The path is
+  // known, so pattern matching is the one honest way to keep a branch for a
+  // particular kind of content -- e.g. keeping small sidecar files off a
+  // shingled (SMR) disk that only handles large sequential writes well,
+  // while still letting the media itself land there.
+  std::vector<std::string> accept;
+  std::vector<std::string> reject;
+
 public:
   Branch();
   Branch(const Branch&);
@@ -57,6 +69,11 @@ public:
   bool ro(void) const;
   bool nc(void) const;
   bool ro_or_nc(void) const;
+
+  // True when this branch is willing to hold `fusepath`. Branches with no
+  // patterns accept everything, so the common case costs one empty check.
+  bool accepts(const std::string &fusepath) const;
+  bool has_filters(void) const { return (!accept.empty() || !reject.empty()); }
 
 public:
   std::string to_string(void) const;

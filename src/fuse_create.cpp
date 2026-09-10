@@ -227,7 +227,7 @@ _create(const ugid_t          ugid_,
   if(existingpaths.empty())
     return -ENOENT;
 
-  rv = createFunc_(branches_,fusedirpath,createpaths);
+  rv = createFunc_(branches_,fusedirpath,fusepath_,createpaths);
   if(rv < 0)
     return rv;
   if(createpaths.empty())

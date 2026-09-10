@@ -151,44 +151,86 @@ namespace l
 
   static
   int
-  parse_branch(const std::string  &str_,
-               std::string        *glob_,
-               Branch::Mode       *mode_,
-               std::optional<u64> *minfreespace_)
+  parse_patterns(const std::string        &str_,
+                 std::vector<std::string> *out_)
+  {
+    // '|' separates patterns: ',' already delimits branch options and ':'
+    // delimits branches, so neither is available here.
+    for(auto &p : str::split(str_,'|'))
+      {
+        if(!p.empty())
+          out_->push_back(p);
+      }
+
+    return out_->empty() ? -EINVAL : 0;
+  }
+
+  static
+  int
+  parse_branch(const std::string        &str_,
+               std::string              *glob_,
+               Branch::Mode             *mode_,
+               std::optional<u64>       *minfreespace_,
+               std::vector<std::string> *accept_,
+               std::vector<std::string> *reject_)
   {
     int rv;
-    std::string options;
-    std::vector<std::string> v;
+    std::size_t comma;
+    std::string head;
+    std::vector<std::string> hv;
 
-    v = str::rsplit1(str_,'=');
-    switch(v.size())
+    // The mode follows the LAST '=' in the segment before the first ','.
+    // Splitting on the last '=' of the whole string (as this used to) breaks
+    // as soon as an accept=/reject= option appears, since those contain '='
+    // themselves. Restricting the search to the head keeps paths containing
+    // '=' working ("/tmp/with=equals=RW") while leaving the options alone.
+    comma = str_.find(',');
+    head  = ((comma == std::string::npos) ? str_ : str_.substr(0,comma));
+
+    hv = str::rsplit1(head,'=');
+    if(hv.size() == 1)
       {
-      case 1:
-        *glob_ = v[0];
+        // No mode token at all. Keep the original behaviour of treating the
+        // entire string as the glob, commas included -- a path may contain one.
+        *glob_ = str_;
         *mode_ = Branch::Mode::RW;
-        break;
-      case 2:
-        *glob_  = v[0];
-        options = v[1];
-        v = str::split(options,',');
-        switch(v.size())
+        return 0;
+      }
+
+    *glob_ = hv[0];
+
+    rv = l::parse_mode(hv[1],mode_);
+    if(rv < 0)
+      return rv;
+
+    if(comma == std::string::npos)
+      return 0;
+
+    // Remaining options are either a bare size (minfreespace, kept positional
+    // for backwards compatibility) or key=value.
+    for(const auto &opt : str::split(str_.substr(comma + 1),','))
+      {
+        auto [key,val] = str::splitkv(opt,'=');
+
+        if(val.empty())
           {
-          case 2:
-            rv = l::parse_minfreespace(v[1],minfreespace_);
+            rv = l::parse_minfreespace(opt,minfreespace_);
             if(rv < 0)
               return rv;
-            [[fallthrough]];
-          case 1:
-            rv = l::parse_mode(v[0],mode_);
-            if(rv < 0)
-              return rv;
-            break;
-          case 0:
-            return -EINVAL;
+            continue;
           }
-        break;
-      default:
-        return -EINVAL;
+
+        if(key == "accept")
+          rv = l::parse_patterns(std::string(val),accept_);
+        else if(key == "reject")
+          rv = l::parse_patterns(std::string(val),reject_);
+        else if(key == "minfreespace")
+          rv = l::parse_minfreespace(std::string(val),minfreespace_);
+        else
+          return -EINVAL;
+
+        if(rv < 0)
+          return rv;
       }
 
     return 0;
@@ -207,7 +249,8 @@ namespace l
 
     branch._minfreespace = &branches_->minfreespace();
 
-    rv = l::parse_branch(str_,&glob,&branch.mode,&minfreespace);
+    rv = l::parse_branch(str_,&glob,&branch.mode,&minfreespace,
+                         &branch.accept,&branch.reject);
     if(rv < 0)
       return rv;
 

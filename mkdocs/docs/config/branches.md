@@ -9,12 +9,14 @@ duplicated for paths on the same filesystem and any features which
 aren't supported by the underlying filesystem (such as file attributes
 or extended attributes) will return the appropriate errors.
 
-Branches currently have two options which can be set. A
+Branches have a number of options which can be set. A
 [mode](#branch-mode) which impacts whether or not the branch is
-included in a policy calculation and a individual
-[minfreespace](#minfreespace) value. The values are set by
-prepending an `=` at the end of a branch designation and using commas
-as delimiters. Example: `/mnt/drive=RW,1234`
+included in a policy calculation, an individual
+[minfreespace](#minfreespace) value, and
+[accept/reject patterns](#accept-and-reject) which restrict what may
+be created on the branch. The values are set by prepending an `=` at
+the end of a branch designation and using commas as delimiters.
+Example: `/mnt/drive=RW,1234`
 
 
 ### branch mode
@@ -32,6 +34,54 @@ as delimiters. Example: `/mnt/drive=RW,1234`
 
 Same purpose and syntax as the [global option](minfreespace.md) but
 specific to the branch. Defaults to the global value.
+
+
+### accept and reject
+
+`accept` and `reject` restrict which paths a branch will accept *new
+files* for. Both take a `|` delimited list of
+[glob](http://linux.die.net/man/7/fnmatch) patterns.
+
+```
+/mnt/archive=RW,accept=/Movies/*|/TV/*
+/mnt/fast=RW,reject=*.mkv|*.iso
+/mnt/archive=RW,accept=*.mkv,reject=*sample*
+```
+
+- Patterns are matched against the full path within the pool, anchored
+  at the pool root. A file created at `<mountpoint>/Movies/film.mkv` is
+  matched as `/Movies/film.mkv`.
+- `*` matches `/` as well, so `/downloads/*` also matches
+  `/downloads/sub/dir/file.mkv`.
+- An empty `accept` list means "anything not rejected".
+- **`reject` wins over `accept`.** Writing both means "these, except
+  those".
+- If no branch accepts a path, `create` fails with `ENOSPC` rather than
+  silently placing the file somewhere the rules forbid.
+
+Only the `create` category is filtered. `action` and `search` policies
+ignore these patterns entirely, so files that already live on a branch
+stay readable, writable, renameable and removable no matter what the
+patterns say. Directory creation is likewise never filtered — the
+directory tree must be able to exist on every branch or a
+path-preserving `create` policy could never place a file on a filtered
+branch at all.
+
+A typical use is keeping sustained write traffic off a drive that
+handles it badly (an SMR disk, for example) while still letting it hold
+finished media:
+
+```
+/mnt/smr=RW,reject=/downloads/*|/usenet/*
+```
+
+**NOTE:** Patterns constrain *placement*, not *content*. They do not
+move files that are already on a branch, and they have no effect on a
+`create` policy that has only one branch to choose from.
+
+**NOTE:** `,` delimits branch options and `:` delimits branches, so
+neither character is available inside a pattern. That is why `|` is the
+pattern separator.
 
 
 ### globbing
