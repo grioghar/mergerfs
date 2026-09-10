@@ -20,6 +20,7 @@
 
 #include "branches.hpp"
 #include "category.hpp"
+#include "config_balance.hpp"
 #include "config_cachefiles.hpp"
 #include "config_debug.hpp"
 #include "config_dummy.hpp"
@@ -109,6 +110,11 @@ public:
 public:
   ConfigBOOL     allow_idmap;
   ConfigBOOL     async_read;
+  BalanceEnabled balance;
+  BalanceGap     balance_gap;
+  BalanceCount   balance_count;
+  BalanceMinFree balance_min_free;
+  BalanceStatus  balance_status;
   Branches       branches;
   ConfigU64      branches_mount_timeout;
   ConfigBOOL     branches_mount_timeout_fail;
@@ -131,6 +137,12 @@ public:
   ConfigSTR      fsname;
   Funcs          func;
   ConfigPageSize fuse_msg_size;
+  HealthMode       health;
+  HealthInterval   health_interval;
+  HealthMaxTemp    health_max_temp;
+  HealthMaxPending health_max_pending;
+  HealthMaxRealloc health_max_realloc;
+  HealthStatus     health_status;
   ConfigBOOL     handle_killpriv;
   ConfigBOOL     handle_killpriv_v2;
   ConfigBOOL     ignorepponrename;
