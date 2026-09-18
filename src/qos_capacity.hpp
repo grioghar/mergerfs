@@ -81,5 +81,9 @@ namespace qos
     // unmount: a probe thread still touching governor state while the
     // process's statics are being destroyed is a crash on the way out.
     void stop();
+
+    // Marks the point after which a probe may be started. See
+    // qos::govern::post_fork().
+    void post_fork();
   }
 }

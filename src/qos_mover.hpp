@@ -103,5 +103,9 @@ namespace qos
     Stats stats();
 
     void stop();
+
+    // See qos::govern::post_fork(): a policy given at mount time is
+    // recorded, and its thread is created from FUSE::init.
+    void post_fork();
   }
 }

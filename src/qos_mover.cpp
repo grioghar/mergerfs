@@ -111,6 +111,7 @@ namespace
   std::thread             g_thread;
   bool                    g_stop    = false;
   bool                    g_started = false;
+  bool                    g_post_fork = false;
 
   Settings g_settings;
 
@@ -899,7 +900,7 @@ namespace
   void
   _start_locked()
   {
-    if(g_started)
+    if(g_started || !g_post_fork)
       return;
 
     g_stop    = false;
@@ -1104,6 +1105,17 @@ qos::mover::status()
 }
 
 void
+qos::mover::post_fork()
+{
+  std::lock_guard<std::mutex> lk(g_mutex);
+
+  g_post_fork = true;
+
+  if(g_settings.policy != MoverPolicy::OFF)
+    ::_start_locked();
+}
+
+void
 qos::mover::stop()
 {
   {
@@ -1153,6 +1165,11 @@ qos::mover::stats()
 
 void
 qos::mover::stop()
+{
+}
+
+void
+qos::mover::post_fork()
 {
 }
 

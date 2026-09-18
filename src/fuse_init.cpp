@@ -21,6 +21,9 @@
 #include "config.hpp"
 #include "fs_readahead.hpp"
 #include "procfs.hpp"
+#include "qos_capacity.hpp"
+#include "qos_govern.hpp"
+#include "qos_mover.hpp"
 #include "state.hpp"
 #include "syslog.hpp"
 
@@ -189,6 +192,15 @@ FUSE::init(fuse_conn_info_t *conn_)
 {
   procfs::init();
   cfg.readdir.initialize();
+
+  // This runs in the process that will serve requests, after mergerfs
+  // has daemonised. Background threads asked for at mount time are
+  // created here and not a moment earlier: a thread started while the
+  // options were being parsed would not survive the fork, while the
+  // flag saying it had been started would.
+  qos::govern::post_fork();
+  qos::mover::post_fork();
+  qos::capacity::post_fork();
 
   ::_want_if_capable(conn_,FUSE_CAP_ASYNC_DIO);
   ::_want_if_capable(conn_,FUSE_CAP_ASYNC_READ,&cfg.async_read);

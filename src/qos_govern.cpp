@@ -73,6 +73,7 @@ namespace
   std::thread                            g_thread;
   bool                                   g_stop = false;
   bool                                   g_started = false;
+  bool                                   g_post_fork = false;
   std::atomic<u64>                       g_interval{0};
   std::unordered_map<pid_t,Applied>      g_applied;
 
@@ -374,12 +375,24 @@ qos::govern::start()
 {
   std::lock_guard<std::mutex> lk(g_mutex);
 
-  if(g_started)
+  if(g_started || !g_post_fork)
     return;
 
   g_stop    = false;
   g_started = true;
   g_thread  = std::thread(::_loop);
+}
+
+void
+qos::govern::post_fork()
+{
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_post_fork = true;
+  }
+
+  if(g_interval.load(std::memory_order_relaxed) != 0)
+    qos::govern::start();
 }
 
 void
@@ -462,6 +475,11 @@ qos::govern::interval()
 
 void
 qos::govern::start()
+{
+}
+
+void
+qos::govern::post_fork()
 {
 }
 

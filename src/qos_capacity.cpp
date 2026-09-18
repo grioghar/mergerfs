@@ -80,6 +80,7 @@ namespace
   };
 
   std::mutex         g_mutex;
+  std::atomic<bool>  g_post_fork{false};
   std::atomic<bool>  g_running{false};
   std::atomic<bool>  g_stop{false};
   std::thread        g_thread;
@@ -401,6 +402,12 @@ qos::capacity::start(const std::vector<fs::path> &branches_,
   if(branches_.empty())
     return -EINVAL;
 
+  // A probe thread created before mergerfs daemonises would not
+  // survive the fork. qos.calibrate is a runtime action, not a mount
+  // option; refuse rather than pretend.
+  if(!g_post_fork.load(std::memory_order_acquire))
+    return -EAGAIN;
+
   const u64 seconds = std::min<u64>(std::max<u64>(seconds_,1),MAX_SECONDS);
 
   bool expected = false;
@@ -439,6 +446,12 @@ qos::capacity::start(const std::vector<fs::path> &branches_,
   g_thread = std::thread(::_run,std::move(paths),seconds,allow_write_);
 
   return 0;
+}
+
+void
+qos::capacity::post_fork()
+{
+  g_post_fork.store(true,std::memory_order_release);
 }
 
 void
@@ -513,6 +526,11 @@ qos::capacity::status()
 
 void
 qos::capacity::stop()
+{
+}
+
+void
+qos::capacity::post_fork()
 {
 }
 

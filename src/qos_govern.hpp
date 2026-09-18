@@ -67,7 +67,16 @@ namespace qos
     u64  interval();
 
     // Starts the sweep thread if it is not already running. Idempotent.
+    // A no-op until post_fork() has been called: mergerfs daemonises
+    // after parsing its options, and a thread created before that fork
+    // does not exist in the child -- while the flag saying it was
+    // started does. Options given at mount time therefore only record
+    // the interval; the thread is created from FUSE::init.
     void start();
+
+    // Called once from FUSE::init, i.e. in the process that will serve
+    // requests. Starts the thread if an interval was configured.
+    void post_fork();
 
     // Asks the thread to stop and waits for it. Safe to call when it
     // was never started.
