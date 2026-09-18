@@ -129,6 +129,14 @@ namespace
   // Cumulative counters from /sys/block/<disk>/stat; rates are deltas
   // between two reads of this document, which is the cadence a
   // dashboard polls at. The first read of a disk reports zero rates.
+  struct DiskRates
+  {
+    double util_pct  = 0;
+    double await_ms  = 0;
+    double read_bps  = 0;
+    double write_bps = 0;
+  };
+
   struct DiskSample
   {
     u64 ios      = 0;   // reads + writes completed
@@ -137,15 +145,20 @@ namespace
     u64 svc_ms   = 0;   // ms spent reading + writing (summed per request)
     u64 io_ticks = 0;   // ms the queue was non-empty
     u64 at_ns    = 0;
+    DiskRates last;     // what the previous full window computed
   };
 
-  struct DiskRates
-  {
-    double util_pct  = 0;
-    double await_ms  = 0;
-    double read_bps  = 0;
-    double write_bps = 0;
-  };
+  // A window shorter than this is not measured, it is re-reported.
+  //
+  // getxattr is issued twice per read -- once to learn the size, once
+  // for the value -- so the document is generated twice a millisecond
+  // apart, and the copy the caller sees is the second. A window that
+  // short holds one io_ticks tick and no completed request: "100% busy,
+  // 0 MB/s". Concurrent readers (a dashboard polling every 5s and an
+  // operator's getfattr) would likewise shorten each other's windows.
+  // Holding the last full window's figures until this much time has
+  // passed gives every reader the same, meaningful number.
+  constexpr double MIN_WINDOW_S = 2.0;
 
   std::mutex                       g_disk_mutex;
   std::map<std::string,DiskSample> g_disk_prev;
@@ -189,6 +202,13 @@ namespace
     if((prev.at_ns != 0) && (cur.at_ns > prev.at_ns))
       {
         const double dt = (static_cast<double>(cur.at_ns - prev.at_ns) / 1e9);
+
+        if(dt < MIN_WINDOW_S)
+          {
+            *out_ = prev.last;
+            return true;
+          }
+
         const u64 d_ios = ((cur.ios >= prev.ios) ? (cur.ios - prev.ios) : 0);
         const u64 d_svc = ((cur.svc_ms >= prev.svc_ms) ? (cur.svc_ms - prev.svc_ms) : 0);
         const u64 d_tk  = ((cur.io_ticks >= prev.io_ticks) ? (cur.io_ticks - prev.io_ticks) : 0);
@@ -197,6 +217,8 @@ namespace
         out_->await_ms  = (d_ios ? (static_cast<double>(d_svc) / d_ios) : 0.0);
         out_->read_bps  = ((cur.sectors_r >= prev.sectors_r) ? (cur.sectors_r - prev.sectors_r) : 0) * 512.0 / dt;
         out_->write_bps = ((cur.sectors_w >= prev.sectors_w) ? (cur.sectors_w - prev.sectors_w) : 0) * 512.0 / dt;
+
+        cur.last = *out_;
       }
 
     prev = cur;
