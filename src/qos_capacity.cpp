@@ -26,6 +26,7 @@
 
 #if USE_QOS && USE_QOS_CALIBRATE
 
+#include "fs_open_beneath.hpp"
 #include "ioprio.hpp"
 #include "qos.hpp"
 #include "qos_class.hpp"
@@ -80,6 +81,8 @@ namespace
 
   std::mutex         g_mutex;
   std::atomic<bool>  g_running{false};
+  std::atomic<bool>  g_stop{false};
+  std::thread        g_thread;
   std::vector<Probe> g_results;
   std::string        g_started;
   u64                g_total = 0;
@@ -107,17 +110,20 @@ namespace
   }
 
   // Breadth first so a branch whose root holds large files is answered
-  // without descending into a deep tree first.
+  // without descending into a deep tree first. Returns a path relative
+  // to the branch, so the open can be pinned beneath it.
   std::string
   _find_probe_file(const std::string &branch_)
   {
     u64                     seen = 0;
-    std::deque<std::string> queue{branch_};
+    std::deque<std::string> queue{""};
 
     while(!queue.empty())
       {
-        const std::string dir = queue.front();
+        const std::string rel = queue.front();
         queue.pop_front();
+
+        const std::string dir = (rel.empty() ? branch_ : (branch_ + "/" + rel));
 
         DIR *d = ::opendir(dir.c_str());
         if(d == nullptr)
@@ -136,21 +142,23 @@ namespace
                 return {};
               }
 
-            const std::string path = (dir + "/" + de->d_name);
+            const std::string childrel = (rel.empty()
+                                          ? std::string(de->d_name)
+                                          : (rel + "/" + de->d_name));
 
             struct stat st;
             // Deliberately lstat: a symlink out of the branch would
             // measure a different device entirely.
-            if(::lstat(path.c_str(),&st) != 0)
+            if(::lstat((branch_ + "/" + childrel).c_str(),&st) != 0)
               continue;
 
             if(S_ISDIR(st.st_mode))
-              queue.push_back(path);
+              queue.push_back(childrel);
             else if(S_ISREG(st.st_mode) &&
                     (static_cast<u64>(st.st_size) >= MIN_PROBE_SIZE))
               {
                 ::closedir(d);
-                return path;
+                return childrel;
               }
           }
 
@@ -160,17 +168,47 @@ namespace
     return {};
   }
 
+  std::string
+  _errstr(const int err_)
+  {
+    char buf[128];
+
+    return ::strerror_r(err_,buf,sizeof(buf));
+  }
+
   // Sequential O_DIRECT read from a random aligned offset. Returns
   // bytes/sec, or 0 with `err_` set.
   u64
-  _measure_read(const std::string &path_,
+  _measure_read(const std::string &branch_,
+                const std::string &relpath_,
                 const u64          seconds_,
                 std::string       *err_)
   {
-    const int fd = ::open(path_.c_str(),O_RDONLY | O_DIRECT);
+    // The scan saw a regular file here a moment ago. Opened through a
+    // walk that follows no symlink, so a directory swapped for a link
+    // since then cannot point this root-privileged read anywhere else.
+    const int root = ::open(branch_.c_str(),O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if(root < 0)
+      {
+        *err_ = fmt::format("open branch: {}",::_errstr(errno));
+        return 0;
+      }
+
+    std::string base;
+    const int dir = fs::open_parent_beneath(root,relpath_,&base);
+    ::close(root);
+    if(dir < 0)
+      {
+        *err_ = fmt::format("resolve probe file: {}",::_errstr(-dir));
+        return 0;
+      }
+
+    const int fd = ::openat(dir,base.c_str(),
+                            O_RDONLY | O_DIRECT | O_NOFOLLOW | O_CLOEXEC);
+    ::close(dir);
     if(fd < 0)
       {
-        *err_ = fmt::format("open O_DIRECT: {}",::strerror(errno));
+        *err_ = fmt::format("open O_DIRECT: {}",::_errstr(errno));
         return 0;
       }
 
@@ -202,7 +240,7 @@ namespace
     const u64 deadline = (t0 + (seconds_ * NS_PER_SEC));
 
     u64 total = 0;
-    while(::_now_ns() < deadline)
+    while((::_now_ns() < deadline) && !g_stop.load(std::memory_order_relaxed))
       {
         if((offset + BLOCK) > size)
           offset = 0;
@@ -247,7 +285,7 @@ namespace
                           0600);
     if(fd < 0)
       {
-        *err_ = fmt::format("create probe file: {}",::strerror(errno));
+        *err_ = fmt::format("create probe file: {}",::_errstr(errno));
         return 0;
       }
 
@@ -266,7 +304,7 @@ namespace
     const u64 deadline = (t0 + (seconds_ * NS_PER_SEC));
 
     u64 total = 0;
-    while(::_now_ns() < deadline)
+    while((::_now_ns() < deadline) && !g_stop.load(std::memory_order_relaxed))
       {
         const ssize_t n = ::pwrite(fd,buf,BLOCK,static_cast<off_t>(total));
         if(n <= 0)
@@ -300,6 +338,9 @@ namespace
 
     for(const auto &branch : branches_)
       {
+        if(g_stop.load(std::memory_order_relaxed))
+          break;
+
         Probe p;
 
         p.branch = branch;
@@ -314,7 +355,7 @@ namespace
           {
             std::string err;
 
-            p.read_bps = ::_measure_read(file,seconds_,&err);
+            p.read_bps = ::_measure_read(branch,file,seconds_,&err);
             if(p.read_bps == 0)
               p.error = err;
           }
@@ -388,12 +429,25 @@ qos::capacity::start(const std::vector<fs::path> &branches_,
     g_started = buf;
   }
 
-  // Detached: a calibration outlives the setxattr that asked for it,
-  // and its results are collected by reading the key back rather than
-  // by joining.
-  std::thread(::_run,std::move(paths),seconds,allow_write_).detach();
+  // Joinable, not detached: a calibration outlives the setxattr that
+  // asked for it, but it must not outlive the mount. stop() joins it
+  // at unmount; here the previous run's thread is reaped first.
+  if(g_thread.joinable())
+    g_thread.join();
+
+  g_stop.store(false,std::memory_order_relaxed);
+  g_thread = std::thread(::_run,std::move(paths),seconds,allow_write_);
 
   return 0;
+}
+
+void
+qos::capacity::stop()
+{
+  g_stop.store(true,std::memory_order_relaxed);
+
+  if(g_thread.joinable())
+    g_thread.join();
 }
 
 std::string
@@ -455,6 +509,11 @@ std::string
 qos::capacity::status()
 {
   return "unsupported (built without USE_QOS_CALIBRATE)\n";
+}
+
+void
+qos::capacity::stop()
+{
 }
 
 #endif

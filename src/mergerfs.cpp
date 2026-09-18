@@ -31,6 +31,7 @@
 #include "oom.hpp"
 #include "option_parser.hpp"
 #include "procfs.hpp"
+#include "qos_capacity.hpp"
 #include "qos_govern.hpp"
 #include "qos_mover.hpp"
 #include "resources.hpp"
@@ -379,6 +380,7 @@ _main(int    argc_,
   // std::thread that is still joinable when its storage is destroyed
   // calls std::terminate, so the process would abort on the way out of
   // an otherwise clean unmount.
+  qos::capacity::stop();
   qos::govern::stop();
   qos::mover::stop();
 

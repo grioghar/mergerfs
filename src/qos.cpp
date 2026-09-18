@@ -187,7 +187,11 @@ namespace
         return;
       }
 
-    if((now_ - start) < CAPACITY_WINDOW_NS)
+    // Two threads read the clock, the later one rolls the window
+    // first, and the earlier one then sees a start in its future.
+    // Unsigned subtraction would turn that into an enormous elapsed
+    // time and a spurious near-zero sample.
+    if((now_ < start) || ((now_ - start) < CAPACITY_WINDOW_NS))
       return;
 
     // Exactly one thread rolls the window; the losers of this exchange
@@ -218,6 +222,25 @@ namespace
     else
       g_->observed.store(observed - (observed >> CAPACITY_DECAY_SHIFT),
                          std::memory_order_relaxed);
+  }
+
+  qos::Governor *
+  _governor_cached(const std::string  &resource_,
+                   std::atomic<void*> *cache_)
+  {
+    if(cache_ != nullptr)
+      {
+        void *p = cache_->load(std::memory_order_relaxed);
+        if(p != nullptr)
+          return static_cast<qos::Governor*>(p);
+      }
+
+    qos::Governor *g = ::_governor_for(resource_);
+
+    if(cache_ != nullptr)
+      cache_->store(g,std::memory_order_relaxed);
+
+    return g;
   }
 
   std::mutex          g_mutex;
@@ -443,9 +466,10 @@ qos::timing_start(const Apply &apply_)
 }
 
 void
-qos::timing_end(const Apply       &apply_,
-                const std::string &resource_,
-                const u64          started_)
+qos::timing_end(const Apply        &apply_,
+                const std::string  &resource_,
+                const u64           started_,
+                std::atomic<void*> *cache_)
 {
   if(started_ == 0)
     return;
@@ -453,7 +477,7 @@ qos::timing_end(const Apply       &apply_,
   const u64 now = ::_now_ns();
   const u64 latency = ((now > started_) ? (now - started_) : 0);
 
-  qos::Governor *g = ::_governor_for(resource_);
+  qos::Governor *g = ::_governor_cached(resource_,cache_);
 
   std::lock_guard<std::mutex> lk(g->mutex);
 
@@ -613,23 +637,38 @@ qos::core_info()
   return rv;
 }
 
+namespace
+{
+  void
+  _note_yielding(qos::Governor *g_)
+  {
+    const u64 now = ::_now_ns();
+
+    std::lock_guard<std::mutex> lk(g_->mutex);
+
+    g_->yielding_at = now;
+  }
+
+  double _pressure(qos::Governor *g_);
+}
+
 void
 qos::note_yielding(const std::string &resource_)
 {
-  qos::Governor *g = ::_governor_for(resource_);
-
-  const u64 now = ::_now_ns();
-
-  std::lock_guard<std::mutex> lk(g->mutex);
-
-  g->yielding_at = now;
+  ::_note_yielding(::_governor_for(resource_));
 }
 
 double
 qos::pressure(const std::string &resource_)
 {
-  qos::Governor *g = ::_governor_for(resource_);
+  return ::_pressure(::_governor_for(resource_));
+}
 
+namespace
+{
+double
+_pressure(qos::Governor *g)
+{
   const u64 now = ::_now_ns();
 
   std::lock_guard<std::mutex> lk(g->mutex);
@@ -673,11 +712,13 @@ qos::pressure(const std::string &resource_)
 
   return std::max(g->pressure,gpu_floor);
 }
+}
 
 void
-qos::throttle(const Apply       &apply_,
-              const u64          bytes_,
-              const std::string &resource_)
+qos::throttle(const Apply        &apply_,
+              const u64           bytes_,
+              const std::string  &resource_,
+              std::atomic<void*> *cache_)
 {
   const Class *cls = apply_.cls();
 
@@ -696,11 +737,12 @@ qos::throttle(const Apply       &apply_,
   //
   // A ruleset that resolves nothing against capacity pays nothing for
   // this -- no governor lookup, no clock read.
-  u64 measured = 0;
+  u64            measured = 0;
+  qos::Governor *gov      = nullptr;
 
   if((rs != nullptr) && rs->needs_capacity())
     {
-      qos::Governor *gov = ::_governor_for(resource_);
+      gov = ::_governor_cached(resource_,cache_);
 
       ::_note_throughput(gov,bytes_,::_now_ns());
 
@@ -739,9 +781,12 @@ qos::throttle(const Apply       &apply_,
       // downloads are hammering the disk" from "playback is slow
       // because the disk is slow", and only the first is worth
       // reacting to.
-      qos::note_yielding(resource_);
+      if(gov == nullptr)
+        gov = ::_governor_cached(resource_,cache_);
 
-      const double p = qos::pressure(resource_);
+      ::_note_yielding(gov);
+
+      const double p = ::_pressure(gov);
 
       if(p <= 0.0)
         {

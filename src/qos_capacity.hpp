@@ -76,5 +76,10 @@ namespace qos
     // True while a probe is in flight. The mover consults this so its
     // own I/O does not corrupt the measurement it is waiting on.
     bool running();
+
+    // Asks a running probe to stop and waits for it. Called at
+    // unmount: a probe thread still touching governor state while the
+    // process's statics are being destroyed is a crash on the way out.
+    void stop();
   }
 }

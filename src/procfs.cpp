@@ -21,6 +21,10 @@
 #endif
 
 #include "procfs.hpp"
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
 
 #include "fatal.hpp"
 #include "fs_close.hpp"
@@ -173,4 +177,33 @@ procfs::get_cmdline(const int pid_)
   buf[rv] = '\0';
 
   return buf.data();
+}
+
+uid_t
+procfs::get_fsuid(const int pid_)
+{
+  char buf[4096];
+
+  const std::string path = fmt::format("/proc/{}/status",pid_);
+
+  const int fd = ::open(path.c_str(),O_RDONLY | O_CLOEXEC);
+  if(fd < 0)
+    return static_cast<uid_t>(-1);
+
+  const ssize_t n = ::read(fd,buf,sizeof(buf) - 1);
+  ::close(fd);
+  if(n <= 0)
+    return static_cast<uid_t>(-1);
+  buf[n] = '\0';
+
+  // "Uid:\treal\teffective\tsaved\tfs"
+  const char *p = ::strstr(buf,"\nUid:");
+  if(p == nullptr)
+    return static_cast<uid_t>(-1);
+
+  unsigned long r, e, sv, f;
+  if(::sscanf(p + 5,"%lu %lu %lu %lu",&r,&e,&sv,&f) != 4)
+    return static_cast<uid_t>(-1);
+
+  return static_cast<uid_t>(f);
 }

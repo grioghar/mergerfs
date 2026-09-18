@@ -536,6 +536,26 @@ announces its traffic to the governor. A third party tool writing to a
 branch behind mergerfs's back remains outside all of this.
 
 
+## Who may change these
+
+The control file is `0664`, owned by the daemon's uid and gid, and the
+kernel's permission check on that mode is what keeps other users away
+from every `mergerfs` runtime key. The `qos.*` keys are additionally
+gated inside the daemon: assigning one requires the caller to be root
+or the daemon's own uid, and a member of the daemon's group who can
+write every other key is refused these with `EPERM`. Reading is not
+restricted.
+
+The distinction exists because these keys are not configuration in the
+way `cache.attr` is. `qos.govern` renices other users' processes,
+`qos.calibrate` with `write` creates files on every branch, and
+`qos.mover` relocates data -- all with the daemon's privilege.
+
+The check identifies the caller from the request's pid when the kernel
+does not put credentials in the request header, which recent kernels do
+not for `setxattr`. A caller it cannot identify is refused.
+
+
 ## Build options
 
 Every piece of this can be compiled out. `USE_QOS=0` removes the

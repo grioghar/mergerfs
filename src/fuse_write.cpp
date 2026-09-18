@@ -207,13 +207,13 @@ FUSE::write(const fuse_req_ctx_t   *ctx_,
   // Charged and, if over rate, slept for before any FileInfo lock is
   // taken. Sleeping while holding fi->mutex would stall every other
   // writer to the same file regardless of its class.
-  qos::throttle(q,count_,fi->branch.path.native());
+  qos::throttle(q,count_,fi->branch.path.native(),&fi->qos_gov);
 
   const u64 t0 = qos::timing_start(q);
 
   const int rv = ::_write(fi,buf_,count_,offset_);
 
-  qos::timing_end(q,fi->branch.path.native(),t0);
+  qos::timing_end(q,fi->branch.path.native(),t0,&fi->qos_gov);
 
   return rv;
 }

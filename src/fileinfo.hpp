@@ -50,6 +50,7 @@
 
 #include "base_types.h"
 
+#include <atomic>
 #include <shared_mutex>
 
 
@@ -97,6 +98,9 @@ public:
   int fd;
   Branch branch;
   u32 direct_io:1;
+  // The QoS governor for `branch`, resolved on first use. Opaque here
+  // so this header does not pull in the QoS types; qos.cpp owns it.
+  std::atomic<void*> qos_gov{nullptr};
   // Serializes the fd state across concurrent writes on the same open
   // file. Concurrent writes happen with:
   // 1) writeback-cache + page-cache mode

@@ -22,7 +22,9 @@
 #include "syslog.hpp"
 
 #include "fmt/core.h"
+#include "subprocess/subprocess.hpp"
 
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 
@@ -98,24 +100,22 @@ namespace
             return real.substr(pos + 1);
           }
 
-        // device-mapper: descend into the first slave
+        // device-mapper: descend into the first slave. Read directly;
+        // no reason to start a shell to list one directory, and every
+        // reason not to from a root daemon.
         std::string slaves = real + "/slaves";
-        if(::stat(slaves.c_str(),&ds) == 0)
+        if(DIR *sd = ::opendir(slaves.c_str()))
           {
-            FILE *p = ::popen(fmt::format("ls -1 {} 2>/dev/null | head -1",slaves).c_str(),"r");
-            if(p)
+            std::string first;
+            while(struct dirent *de = ::readdir(sd))
               {
-                char name[256] = {0};
-                if(::fgets(name,sizeof(name),p))
-                  {
-                    std::string s(name);
-                    while(!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
-                    ::pclose(p);
-                    if(!s.empty()) { cur = "/sys/class/block/" + s; continue; }
-                  }
-                else
-                  ::pclose(p);
+                if((de->d_name[0] == '.'))
+                  continue;
+                first = de->d_name;
+                break;
               }
+            ::closedir(sd);
+            if(!first.empty()) { cur = "/sys/class/block/" + first; continue; }
           }
 
         // partition: parent directory is the disk
@@ -141,18 +141,33 @@ namespace
   _read_smart(const std::string &disk_,
               Report            &r_)
   {
-    const std::string cmd =
-      fmt::format("smartctl -A /dev/{} 2>/dev/null",disk_);
-
-    FILE *p = ::popen(cmd.c_str(),"r");
-    if(p == nullptr)
-      return false;
-
-    char line[512];
-    bool any = false;
-    while(::fgets(line,sizeof(line),p))
+    // argv, not a shell: the device name comes from sysfs and cannot
+    // carry metacharacters, but a root daemon has no business handing
+    // anything to /bin/sh -c, and an absolute path removes the PATH
+    // lookup from the question as well.
+    std::string out;
+    try
       {
-        std::string s(line);
+        auto buf = subprocess::check_output({"/usr/sbin/smartctl","-A",
+                                             fmt::format("/dev/{}",disk_)});
+        out.assign(buf.buf.data(),buf.length);
+      }
+    catch(const std::exception &)
+      {
+        // smartctl exits non-zero for a great many benign reasons
+        // (bits set in its status mask for any attribute past
+        // threshold). Its output is still worth parsing; only a
+        // failure to run at all leaves nothing to read.
+        return false;
+      }
+
+    bool any = false;
+    std::size_t pos = 0;
+    while(pos < out.size())
+      {
+        const std::size_t nl = out.find('\n',pos);
+        std::string s = out.substr(pos,((nl == std::string::npos) ? std::string::npos : (nl - pos)));
+        pos = ((nl == std::string::npos) ? out.size() : (nl + 1));
         u64 *dst = nullptr;
 
         if(s.find("Current_Pending_Sector") != std::string::npos)
@@ -182,8 +197,6 @@ namespace
         try { *dst = std::stoull(val); any = true; }
         catch(...) { }
       }
-
-    ::pclose(p);
 
     return any;
   }

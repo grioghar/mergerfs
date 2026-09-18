@@ -250,6 +250,15 @@ namespace
         if((cls == nullptr) || !cls->govern)
           continue;
 
+        // Only a process some rule *named* is touched. The default
+        // class catches everything a ruleset did not describe, which
+        // for pool I/O is the right fallback -- but applied here it
+        // would renice init, sshd and the shell of whoever is trying
+        // to fix it. `default` carrying `govern` is therefore inert for
+        // the sweep, by design and not by accident.
+        if(cls == rs_->default_class())
+          continue;
+
         if((cls->effective_govern_ioprio() == qos::UNSET) &&
            (cls->effective_govern_nice()   == qos::UNSET))
           continue;

@@ -77,7 +77,7 @@ FUSE::read(const fuse_req_ctx_t   *ctx_,
   // file is being read, and so the rate is charged against the branch
   // actually serving it.
   qos::Apply q(ctx_,&fi->fusepath.native(),qos::Direction::READ);
-  qos::throttle(q,size_,fi->branch.path.native());
+  qos::throttle(q,size_,fi->branch.path.native(),&fi->qos_gov);
 
   // Timed only for protected classes. How long a player's reads
   // actually take is the signal the governor throttles everything
@@ -89,7 +89,7 @@ FUSE::read(const fuse_req_ctx_t   *ctx_,
                   ? ::_read_direct_io(fi->fd,buf_,size_,offset_)
                   : ::_read_cached(fi->fd,buf_,size_,offset_));
 
-  qos::timing_end(q,fi->branch.path.native(),t0);
+  qos::timing_end(q,fi->branch.path.native(),t0,&fi->qos_gov);
 
   return rv;
 }

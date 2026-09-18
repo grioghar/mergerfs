@@ -18,6 +18,8 @@
 
 #include "fuse_setxattr.hpp"
 
+#include "procfs.hpp"
+
 #include "config.hpp"
 #include "errno.hpp"
 #include "fs_glob.hpp"
@@ -66,12 +68,50 @@ _is_attrname_security_capability(const char *attrname_)
   return str::eq(attrname_,SECURITY_CAPABILITY);
 }
 
+// The control file is synthesised as mode 0664 owned by the daemon's
+// uid, and it is the kernel's permission check on that mode -- active
+// only with kernel-permissions-check=true -- that normally keeps other
+// users out. The qos.* keys are different in kind from the rest of the
+// configuration: assigning one can renice arbitrary processes, write
+// probe files onto every branch, or set the mover relocating data, all
+// with the daemon's privilege. Those are gated here explicitly so that
+// disabling the kernel check for some unrelated reason does not quietly
+// hand them to every local user.
+//
+// Recent kernels issue FUSE_SETXATTR without credentials in the request
+// header -- uid and gid arrive as (uint32_t)-1 -- even though the
+// FUSE_CREATE from the same shell carries them (observed on 7.0). The
+// pid is still filled in, so when the header says nothing the caller is
+// looked up through /proc instead. Failing that, the write is refused:
+// an unidentifiable caller is not a privileged one.
+static
+bool
+_privileged_key(const std::string    &key_,
+                const fuse_req_ctx_t *ctx_)
+{
+  static const uid_t self = ::getuid();
+
+  if(key_.rfind("qos",0) != 0)
+    return true;
+
+  uid_t caller = ctx_->uid;
+
+  if(caller == static_cast<uid_t>(-1))
+    caller = procfs::get_fsuid(ctx_->pid);
+
+  if(caller == static_cast<uid_t>(-1))
+    return false;
+
+  return ((caller == 0) || (caller == self));
+}
+
 static
 int
-_setxattr_ctrl_file(const char *attrname_,
-                    const char *attrval_,
-                    size_t      attrvalsize_,
-                    const int   flags_)
+_setxattr_ctrl_file(const fuse_req_ctx_t *ctx_,
+                    const char           *attrname_,
+                    const char           *attrval_,
+                    size_t                attrvalsize_,
+                    const int             flags_)
 {
   int rv;
   std::string key;
@@ -87,6 +127,9 @@ _setxattr_ctrl_file(const char *attrname_,
 
   if(cfg.has_key(key) == false)
     return -ENOATTR;
+
+  if(!::_privileged_key(key,ctx_))
+    return -EPERM;
 
   if((flags_ & XATTR_CREATE) == XATTR_CREATE)
     return -EEXIST;
@@ -216,7 +259,7 @@ FUSE::setxattr(const fuse_req_ctx_t *ctx_,
   const fs::path fusepath{fusepath_};
 
   if(Config::is_ctrl_file(fusepath))
-    return ::_setxattr_ctrl_file(attrname_,
+    return ::_setxattr_ctrl_file(ctx_,attrname_,
                                  attrval_,
                                  attrvalsize_,
                                  flags_);

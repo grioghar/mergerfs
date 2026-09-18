@@ -20,6 +20,8 @@
 
 #include <string>
 
+#include <sys/types.h>
+
 namespace procfs
 {
   extern int PROC_SELF_FD_FD;
@@ -31,6 +33,12 @@ namespace procfs
   // Raw contents of /proc/<pid>/cgroup with the trailing newline
   // removed. Empty when the process is gone or unreadable.
   std::string get_cgroup(const int pid);
+
+  // Filesystem uid of a process, from the Uid: line of
+  // /proc/<pid>/status -- the credential the kernel itself would apply
+  // to that process's file operations. (uid_t)-1 when the process is
+  // gone or unreadable.
+  uid_t get_fsuid(const int pid);
 
   // /proc/<pid>/cmdline with the NUL separators turned into spaces.
   // Truncated to a bounded length: the interesting part of a media

@@ -95,8 +95,10 @@ namespace qos
   };
 
   inline u64  timing_start(const Apply &) { return 0; }
-  inline void timing_end(const Apply &, const std::string &, const u64) {}
-  inline void throttle(const Apply &, const u64, const std::string &) {}
+  inline void timing_end(const Apply &, const std::string &, const u64,
+                         std::atomic<void*> * = nullptr) {}
+  inline void throttle(const Apply &, const u64, const std::string &,
+                       std::atomic<void*> * = nullptr) {}
 
   inline double pressure(const std::string &) { return 0.0; }
   inline void   note_yielding(const std::string &) {}
@@ -178,8 +180,14 @@ namespace qos
   // Returns 0 for a request whose class is not protected, in which
   // case timing_end does nothing. Keeping the clock read out of the
   // unprotected path is why this is split in two.
+  // `cache`, where given, is a per-open-file slot holding the resource's
+  // governor pointer. Governors are never freed, so the pointer is
+  // valid for the life of the mount, and reusing it saves a string
+  // hash, a shared lock and a map lookup on every read and write of
+  // that file.
   u64  timing_start(const Apply &);
-  void timing_end(const Apply &, const std::string &resource, const u64 started);
+  void timing_end(const Apply &, const std::string &resource, const u64 started,
+                  std::atomic<void*> *cache = nullptr);
 
   // Current backoff for a resource, 0.0 to 1.0. Zero when no protected
   // class has touched it recently, which is what lets bulk traffic run
@@ -273,7 +281,8 @@ namespace qos
   // `resource` is the branch serving the request, so a rate is a
   // per-device allowance: a class limited to 10% does not have to
   // share one budget across seven disks.
-  void throttle(const Apply &, const u64 bytes, const std::string &resource);
+  void throttle(const Apply &, const u64 bytes, const std::string &resource,
+                std::atomic<void*> *cache = nullptr);
 
   // Classifies the calling process and applies its class to this
   // thread. The thread keeps those settings until another request

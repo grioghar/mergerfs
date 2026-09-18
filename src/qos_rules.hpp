@@ -116,6 +116,10 @@ namespace qos
 
     const Class *find_class(const std::string_view name) const;
 
+    // The class a subject falls to when no rule matches it. Exposed so
+    // a caller can tell "matched a rule" from "matched nothing".
+    const Class *default_class() const { return _default; }
+
     // Declared throughput of `resource` in bytes/sec, falling back to
     // the `capacity default` line and then to `measured` -- what the
     // daemon has watched the resource actually deliver.

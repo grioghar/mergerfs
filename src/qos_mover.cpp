@@ -25,9 +25,10 @@
 #include "branch.hpp"
 #include "branches.hpp"
 #include "config.hpp"
-#include "fs_clonepath.hpp"
 #include "fs_copyfile.hpp"
+#include "fs_file_unchanged.hpp"
 #include "fs_info.hpp"
+#include "fs_open_beneath.hpp"
 #include "fs_path.hpp"
 #include "ioprio.hpp"
 #include "qos.hpp"
@@ -38,10 +39,12 @@
 #include "fmt/core.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -129,6 +132,16 @@ namespace
 
     return ((static_cast<u64>(ts.tv_sec) * NS_PER_SEC) +
             static_cast<u64>(ts.tv_nsec));
+  }
+
+  // strerror(3) is not thread safe and this runs beside the FUSE
+  // threads, which also format errors.
+  std::string
+  _errstr(const int err_)
+  {
+    char buf[128];
+
+    return ::strerror_r(err_,buf,sizeof(buf));
   }
 
   const char *
@@ -274,59 +287,173 @@ namespace
 
   // Copy, verify, rename, unlink. Returns 0, or a negative errno with
   // the source left exactly as it was.
+  //
+  // Everything here is done through directory fds pinned by a walk
+  // that refuses to follow symlinks (see fs_open_beneath.hpp). The
+  // scan saw a regular file at this relative path some seconds ago;
+  // nothing about the path may be trusted since. A path-based version
+  // of this function, run as root against a branch that pool users can
+  // write to, is a "delete any file on the host" primitive: swap a
+  // directory in the chain for a symlink to /etc between the scan and
+  // the unlink.
   int
-  _move_one(const std::string &src_branch_,
-            const std::string &dst_branch_,
+  _move_one(const int          srcroot_,
+            const int          dstroot_,
             const std::string &relpath_)
   {
-    s64 rv;
+    s64         rv;
+    std::string base;
 
-    const fs::path src_branch(src_branch_);
-    const fs::path dst_branch(dst_branch_);
-    const fs::path relpath(relpath_);
+    const int srcdir = fs::open_parent_beneath(srcroot_,relpath_,&base);
+    if(srcdir < 0)
+      return srcdir;
 
-    const fs::path src_file = (src_branch / relpath);
-    const fs::path dst_file = (dst_branch / relpath);
-
-    // Refusing to overwrite is deliberate. A path existing on both
-    // branches is what mergerfs calls a duplicate, and resolving one
-    // by picking a winner is a policy decision this has no business
-    // making silently.
-    struct stat st;
-    if(::lstat(dst_file.c_str(),&st) == 0)
-      return -EEXIST;
-
-    // Recreate the directory chain on the destination with the same
-    // ownership, permissions and timestamps the source carries.
-    const fs::path relparent = relpath.parent_path();
-    if(!relparent.empty())
+    int src_fd = ::openat(srcdir,base.c_str(),
+                          O_RDONLY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
+    if((src_fd < 0) && (errno == EPERM))
+      src_fd = ::openat(srcdir,base.c_str(),O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if(src_fd < 0)
       {
-        rv = fs::clonepath(src_branch,dst_branch,relparent);
-        if(rv < 0)
-          return static_cast<int>(rv);
-      }
-
-    fs::CopyFileFlags flags = {};
-    flags.cleanup_failure = 1;
-
-    rv = fs::copyfile(src_file,dst_file,flags);
-    if(rv < 0)
-      return static_cast<int>(rv);
-
-    // Only now is it safe to remove the original.
-    if(::unlink(src_file.c_str()) != 0)
-      {
-        // The copy is good but the source will not go away. Remove the
-        // copy rather than leave a duplicate behind: a duplicate is a
-        // state the pool has to resolve on every lookup afterwards.
         const int err = errno;
-
-        ::unlink(dst_file.c_str());
-
+        ::close(srcdir);
         return -err;
       }
 
+    struct stat st;
+    if(::fstat(src_fd,&st) != 0)
+      {
+        const int err = errno;
+        ::close(src_fd);
+        ::close(srcdir);
+        return -err;
+      }
+
+    // Re-checked on the open fd, not the scan's lstat: a link could
+    // have been added since, and this is the one property whose loss
+    // cannot be repaired afterwards.
+    if(!S_ISREG(st.st_mode) || (st.st_nlink != 1))
+      {
+        ::close(src_fd);
+        ::close(srcdir);
+        return (S_ISREG(st.st_mode) ? -EMLINK : -EINVAL);
+      }
+
+    std::string dstbase;
+    const int dstdir = fs::mkdir_parent_beneath(srcroot_,dstroot_,relpath_,&dstbase);
+    if(dstdir < 0)
+      {
+        ::close(src_fd);
+        ::close(srcdir);
+        return dstdir;
+      }
+
+    // O_EXCL on a name nobody else has reason to use. Kept out of the
+    // pool's namespace by the leading dot for the seconds it exists.
+    static std::atomic<u64> seq{0};
+    const std::string tmp = fmt::format(".mergerfs-mover.{}.{}",
+                                        static_cast<int>(::getpid()),
+                                        seq.fetch_add(1));
+
+    const int dst_fd = ::openat(dstdir,tmp.c_str(),
+                                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                                0600);
+    if(dst_fd < 0)
+      {
+        const int err = errno;
+        ::close(dstdir);
+        ::close(src_fd);
+        ::close(srcdir);
+        return -err;
+      }
+
+    auto abandon = [&](const int err_)
+      {
+        ::unlinkat(dstdir,tmp.c_str(),0);
+        ::close(dst_fd);
+        ::close(dstdir);
+        ::close(src_fd);
+        ::close(srcdir);
+        return err_;
+      };
+
+    // Data, xattrs, attrs, ownership, mode, times -- onto the fd.
+    rv = fs::copyfile(src_fd,st,dst_fd);
+    if(rv < 0)
+      return abandon(static_cast<int>(rv));
+
+    // The source is about to be deleted on the strength of this copy,
+    // so the copy has to be on stable storage first. This is the one
+    // place in mergerfs that removes data and it is not on any I/O
+    // path, so the cost is accepted.
+    if(::fsync(dst_fd) != 0)
+      return abandon(-errno);
+
+    // A writer that raced the copy leaves a source newer than what was
+    // read. copyfile's path variant retries; here the pass simply
+    // moves on and the next one finds the file settled.
+    if(fs::file_changed(src_fd,st) != FS_FILE_UNCHANGED)
+      return abandon(-EBUSY);
+
+    ::close(dst_fd);
+
+    // Never overwrite: the kernel refuses atomically rather than this
+    // code checking first and racing.
+#ifdef SYS_renameat2
+    rv = ::syscall(SYS_renameat2,dstdir,tmp.c_str(),dstdir,dstbase.c_str(),
+                   static_cast<unsigned>(1) /* RENAME_NOREPLACE */);
+#else
+    rv = -1; errno = ENOSYS;
+#endif
+    if(rv != 0)
+      {
+        const int err = errno;
+        ::unlinkat(dstdir,tmp.c_str(),0);
+        ::close(dstdir);
+        ::close(src_fd);
+        ::close(srcdir);
+        return -err;
+      }
+
+    ::close(dstdir);
+
+    // Last look before the unlink: the name must still be the inode
+    // that was copied. If the entry was replaced meanwhile, both
+    // copies are left standing -- a duplicate is recoverable, a
+    // deleted stranger's file is not.
+    struct stat now;
+    if((::fstatat(srcdir,base.c_str(),&now,AT_SYMLINK_NOFOLLOW) != 0) ||
+       (now.st_ino != st.st_ino) || (now.st_dev != st.st_dev))
+      {
+        ::close(src_fd);
+        ::close(srcdir);
+        return -ESTALE;
+      }
+
+    if(::unlinkat(srcdir,base.c_str(),0) != 0)
+      {
+        // The copy is good but the source will not go away. Removing
+        // the copy would need its directory fd back; the duplicate is
+        // reported instead and the next pass skips it as EEXIST.
+        const int err = errno;
+        ::close(src_fd);
+        ::close(srcdir);
+        return -err;
+      }
+
+    ::close(src_fd);
+    ::close(srcdir);
+
     return 0;
+  }
+
+  // Opens a branch root for the duration of a pass. O_PATH: it is only
+  // ever a base for *at calls.
+  int
+  _open_root(const std::string &path_)
+  {
+    const int fd = ::open(path_.c_str(),O_PATH | O_DIRECTORY | O_CLOEXEC);
+
+    return ((fd < 0) ? -errno : fd);
   }
 
   // Records the outcome of one move under the lock. EEXIST is expected
@@ -347,7 +474,7 @@ namespace
     else if(rv_ < 0)
       {
         g_errors++;
-        g_last_error = fmt::format("{}: {}",relpath_,::strerror(-rv_));
+        g_last_error = fmt::format("{}: {}",relpath_,::_errstr(-rv_));
       }
     else
       {
@@ -403,7 +530,6 @@ namespace
     const std::string dstpath = dst->branch->path.native();
 
     std::vector<Candidate> candidates;
-    candidates.reserve(MAX_CANDIDATES);
 
     ::_scan(srcpath,candidates,
             [](const Candidate &c_)
@@ -417,15 +543,27 @@ namespace
       return;
 
     // Largest first: the fewest moves that close the gap is also the
-    // fewest chances to interrupt somebody.
-    std::sort(candidates.begin(),candidates.end(),
-              [](const Candidate &a_, const Candidate &b_)
-              {
-                return (a_.size > b_.size);
-              });
+    // fewest chances to interrupt somebody. Only the head of the list
+    // is ever used, so only the head is ordered.
+    const std::size_t keep = std::min(candidates.size(),MAX_CANDIDATES);
 
-    if(candidates.size() > MAX_CANDIDATES)
-      candidates.resize(MAX_CANDIDATES);
+    std::partial_sort(candidates.begin(),candidates.begin() + keep,candidates.end(),
+                      [](const Candidate &a_, const Candidate &b_)
+                      {
+                        return (a_.size > b_.size);
+                      });
+    candidates.resize(keep);
+
+    const int srcroot = ::_open_root(srcpath);
+    if(srcroot < 0)
+      return;
+    const int dstroot = ::_open_root(dstpath);
+    if(dstroot < 0)
+      {
+        ::close(srcroot);
+        return;
+      }
+    struct Roots { int a, b; ~Roots() { ::close(a); ::close(b); } } roots{srcroot,dstroot};
 
     // How many bytes have to leave for the branch to drop under `low`.
     u64 target = 0;
@@ -527,7 +665,7 @@ namespace
         qos::note_yielding(dstpath);
 
         const u64 t0 = ::_now_ns();
-        const int rv = ::_move_one(srcpath,dstpath,c.relpath);
+        const int rv = ::_move_one(srcroot,dstroot,c.relpath);
         const u64 elapsed = (::_now_ns() - t0);
 
         ::_account(rv,c.relpath,c.size);
@@ -612,15 +750,26 @@ namespace
     if(candidates.empty())
       return;
 
-    // Coldest first.
-    std::sort(candidates.begin(),candidates.end(),
-              [](const Candidate &a_, const Candidate &b_)
-              {
-                return (a_.atime < b_.atime);
-              });
+    // Coldest first; only the head is used, so only the head is ordered.
+    const std::size_t keep = std::min(candidates.size(),MAX_CANDIDATES);
 
-    if(candidates.size() > MAX_CANDIDATES)
-      candidates.resize(MAX_CANDIDATES);
+    std::partial_sort(candidates.begin(),candidates.begin() + keep,candidates.end(),
+                      [](const Candidate &a_, const Candidate &b_)
+                      {
+                        return (a_.atime < b_.atime);
+                      });
+    candidates.resize(keep);
+
+    const int srcroot = ::_open_root(srcpath);
+    if(srcroot < 0)
+      return;
+    const int dstroot = ::_open_root(dstpath);
+    if(dstroot < 0)
+      {
+        ::close(srcroot);
+        return;
+      }
+    struct Roots { int a, b; ~Roots() { ::close(a); ::close(b); } } roots{srcroot,dstroot};
 
     u64 avail = dstinfo.spaceavail;
     u64 moved = 0;
@@ -660,7 +809,7 @@ namespace
         qos::note_yielding(srcpath);
         qos::note_yielding(dstpath);
 
-        const int rv = ::_move_one(srcpath,dstpath,c.relpath);
+        const int rv = ::_move_one(srcroot,dstroot,c.relpath);
 
         ::_account(rv,c.relpath,c.size);
 
