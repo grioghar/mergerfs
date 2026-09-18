@@ -99,7 +99,8 @@ wins. A class must be defined before a rule names it.
 | `critical` | never throttled, and *not* a control signal |
 | `yield=` | `0`-`100`: how hard this class gives way under pressure |
 | `floor=` | never back off below this; absolute or a percentage |
-| `govern` | also apply this class's `ioprio` and `nice` to the client process itself; see [The process governor](#the-process-governor) |
+| `govern` | also apply this class's values to the client process itself; see [The process governor](#the-process-governor) |
+| `govern-ioprio=`, `govern-nice=` | what the governor applies to the *process*, when that should differ from what its pool I/O gets; default to `ioprio` / `nice` |
 
 ### Match fields
 
@@ -254,11 +255,21 @@ server also reads and writes outside the pool -- its own database, its
 metadata store, its transcode scratch directory -- and it burns CPU.
 Neither is flattened by FUSE, and both compete with playback.
 
-Marking a class `govern` applies its `ioprio` and `nice` to the client
-process itself, not only to the worker thread serving its pool I/O:
+Marking a class `govern` applies its values to the client process
+itself, not only to the worker thread serving its pool I/O:
 
 ```
 class downloads govern yield=100 floor=5% ioprio=idle nice=19
+```
+
+The two are different axes, and a class may set them separately with
+`govern-ioprio=` and `govern-nice=`. ffprobe is the canonical case: its
+pool reads are a synchronous dependency of starting playback and must
+never be throttled, while its CPU is pure library analysis:
+
+```
+class probe critical govern govern-ioprio=idle govern-nice=19
+match comm ~ ffprobe* -> probe
 ```
 
 ```sh
@@ -290,6 +301,14 @@ Details that matter:
   work.
 * Lowering another process's `nice` needs privilege. Threads that
   could not be set are counted in `failed`.
+* The default class is never applied by the sweep, whatever it says:
+  applied host-wide it would renice init, sshd and your shell.
+* Values are applied, never restored. A process left at `idle` when
+  the mount goes away stays there, exactly as it would after a
+  `renice` from a shell. Restart it, or let its own supervisor.
+* `qos.govern` given as a mount option takes effect once the daemon is
+  serving requests (mergerfs daemonises after parsing its options), so
+  the first sweep lands a few seconds after mount.
 
 
 ## The GPU signal
