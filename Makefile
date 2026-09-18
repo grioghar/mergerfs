@@ -51,6 +51,33 @@ endif
 
 USE_XATTR ?= 1
 
+# Per-client quality of service.
+#
+# USE_QOS=0 removes the subsystem outright: the read and write paths
+# lose their qos::Apply, throttle and timing calls entirely rather than
+# branching past them, and the qos.* runtime keys report unsupported.
+# A build that does not want any of this pays nothing for it.
+#
+# The rest are independent pieces of it, each off at runtime by default
+# and each removable on its own. They only have an effect when USE_QOS
+# is also 1.
+#
+#   GOVERN    - sweeps /proc applying `govern` classes to client
+#               processes. Linux only (nice and ioprio are per thread
+#               there, and the sweep reads /proc).
+#   CALIBRATE - the active O_DIRECT capacity probe. Passive capacity
+#               measurement is part of the core and stays either way.
+#   MOVER     - the background rebalancer that moves existing files
+#               between branches.
+#   GPU       - reads the amdgpu sysfs busy counter as evidence that
+#               playback is happening. No driver, library or link time
+#               dependency in any configuration; Linux only.
+USE_QOS ?= 1
+USE_QOS_GOVERN ?= 1
+USE_QOS_CALIBRATE ?= 1
+USE_QOS_MOVER ?= 1
+USE_QOS_GPU ?= 1
+
 ifdef SANITIZE
 ifeq ($(SANITIZE),1)
   override SANITIZE := -fsanitize=address,undefined,leak
@@ -131,7 +158,12 @@ override INC_FLAGS := \
 	-Ivendored \
 	-Ivendored/libfuse/include
 override MFS_FLAGS  := \
-	-DUSE_XATTR=$(USE_XATTR)
+	-DUSE_XATTR=$(USE_XATTR) \
+	-DUSE_QOS=$(USE_QOS) \
+	-DUSE_QOS_GOVERN=$(USE_QOS_GOVERN) \
+	-DUSE_QOS_CALIBRATE=$(USE_QOS_CALIBRATE) \
+	-DUSE_QOS_MOVER=$(USE_QOS_MOVER) \
+	-DUSE_QOS_GPU=$(USE_QOS_GPU)
 override TESTS_FLAGS := \
 	-Isrc \
 	-Ivendored \
@@ -177,6 +209,11 @@ all: libfuse $(BUILDDIR)/mergerfs $(BUILDDIR)/fsck.mergerfs $(BUILDDIR)/mergerfs
 help:
 	@echo "usage: make ARG\n"
 	@echo "USE_XATTR=0     - build program without xattrs functionality"
+	@echo "USE_QOS=0       - build program without per-client QoS"
+	@echo "USE_QOS_GOVERN=0    - build without the client process governor"
+	@echo "USE_QOS_CALIBRATE=0 - build without the active capacity probe"
+	@echo "USE_QOS_MOVER=0     - build without the background file mover"
+	@echo "USE_QOS_GPU=0       - build without the GPU QoS signal"
 	@echo "STATIC=1        - build static binary"
 	@echo "LTO=1           - build with link time optimization"
 	@echo "SANITIZE=1      - build with sanitizers (address,undefined,leak)"

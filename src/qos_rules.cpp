@@ -18,6 +18,9 @@
 
 #include "qos_rules.hpp"
 
+#if USE_QOS
+
+
 #include "fmt/core.h"
 
 #include <errno.h>
@@ -224,19 +227,24 @@ RuleSet::classify(const Subject &s_) const
 }
 
 u64
-RuleSet::capacity(const std::string &resource_) const
+RuleSet::capacity(const std::string &resource_,
+                  const u64          measured_) const
 {
   auto i = _capacity.find(resource_);
 
   if(i != _capacity.end())
     return i->second;
 
-  return _capacity_default;
+  if(_capacity_default != 0)
+    return _capacity_default;
+
+  return measured_;
 }
 
 u64
 RuleSet::floor_for(const Class       *cls_,
-                   const std::string &resource_) const
+                   const std::string &resource_,
+                   const u64          measured_) const
 {
   if(cls_->floor)
     return cls_->floor;
@@ -244,7 +252,7 @@ RuleSet::floor_for(const Class       *cls_,
   if(cls_->floor_pct == 0)
     return 0;
 
-  const u64 cap = capacity(resource_);
+  const u64 cap = capacity(resource_,measured_);
   if(cap == 0)
     return 0;
 
@@ -253,7 +261,8 @@ RuleSet::floor_for(const Class       *cls_,
 
 u64
 RuleSet::rate_for(const Class       *cls_,
-                  const std::string &resource_) const
+                  const std::string &resource_,
+                  const u64          measured_) const
 {
   if(cls_->rate)
     return cls_->rate;
@@ -261,7 +270,7 @@ RuleSet::rate_for(const Class       *cls_,
   if(cls_->pct == 0)
     return 0;
 
-  const u64 cap = capacity(resource_);
+  const u64 cap = capacity(resource_,measured_);
 
   // No capacity known for this resource means a percentage cannot be
   // turned into a number. Running unlimited is the safe reading: a
@@ -421,6 +430,12 @@ RuleSet::parse(const std::string_view text_,
                   continue;
                 }
 
+              if(tokens[i] == "govern")
+                {
+                  cls->govern = true;
+                  continue;
+                }
+
               const std::size_t eq = tokens[i].find('=');
               if(eq == std::string::npos)
                 return fail(fmt::format("expected key=value, got '{}'",tokens[i]));
@@ -432,6 +447,18 @@ RuleSet::parse(const std::string_view text_,
                 {
                   if(qos::ioprio::from_string(val,&cls->ioprio))
                     return fail(fmt::format("invalid ioprio '{}'",val));
+                }
+              else if(key == "govern-ioprio")
+                {
+                  if(qos::ioprio::from_string(val,&cls->govern_ioprio))
+                    return fail(fmt::format("invalid govern-ioprio '{}'",val));
+                }
+              else if(key == "govern-nice")
+                {
+                  const int n = std::atoi(val.c_str());
+                  if((n < -20) || (n > 19))
+                    return fail(fmt::format("govern-nice out of range: '{}'",val));
+                  cls->govern_nice = n;
                 }
               else if(key == "nice")
                 {
@@ -503,6 +530,22 @@ RuleSet::parse(const std::string_view text_,
 
           if(cls->protect)
             rs->_has_protected = true;
+
+          // Governing a class that sets neither knob would walk /proc
+          // to achieve nothing, so the scan only turns on for a class
+          // that has something to apply.
+          if(cls->govern &&
+             ((cls->effective_govern_ioprio() != qos::UNSET) ||
+              (cls->effective_govern_nice()   != qos::UNSET)))
+            rs->_has_govern = true;
+
+          // A percentage is the only thing that has to be resolved
+          // against a capacity figure, so it is also the only thing
+          // that makes measuring one worthwhile. An adaptive class is
+          // included because the governor scales it against capacity
+          // when it carries no rate of its own.
+          if(cls->pct || cls->floor_pct || cls->adaptive())
+            rs->_needs_capacity = true;
 
           if((cls->ioprio != qos::UNSET) ||
              (cls->nice   != qos::UNSET) ||
@@ -672,18 +715,25 @@ RuleSet::to_string() const
 
   for(const auto &c : _classes)
     {
-      s += fmt::format("class {}{}{} ioprio={} nice={} rate={} burst={} "
-                       "yield={} floor={}\n",
+      s += fmt::format("class {}{}{}{} ioprio={} nice={} rate={} burst={} "
+                       "yield={} floor={}{}{}\n",
                        c->name,
                        (c->protect ? " protect" : ""),
                        (c->critical ? " critical" : ""),
+                       (c->govern ? " govern" : ""),
                        qos::ioprio::to_string(c->ioprio),
                        ((c->nice == qos::UNSET) ? "unset" : std::to_string(c->nice)),
                        (c->pct ? fmt::format("{}%",c->pct) : std::to_string(c->rate)),
                        c->burst,
                        c->yield,
                        (c->floor_pct ? fmt::format("{}%",c->floor_pct)
-                                     : std::to_string(c->floor)));
+                                     : std::to_string(c->floor)),
+                       ((c->govern_ioprio != qos::UNSET)
+                        ? fmt::format(" govern-ioprio={}",qos::ioprio::to_string(c->govern_ioprio))
+                        : std::string{}),
+                       ((c->govern_nice != qos::UNSET)
+                        ? fmt::format(" govern-nice={}",c->govern_nice)
+                        : std::string{}));
     }
 
   for(const auto &r : _rules)
@@ -718,3 +768,5 @@ RuleSet::to_string() const
 
   return s;
 }
+
+#endif

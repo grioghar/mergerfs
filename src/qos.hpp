@@ -48,7 +48,64 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 
+
+// Defined by the build; defaulted here so the header is self contained.
+#ifndef USE_QOS
+#define USE_QOS 1
+#endif
+
+#if !USE_QOS
+
+/*
+  Built without per-client QoS.
+
+  The point of this arm is that the read and write paths do not merely
+  skip the work, they do not contain it. `enabled()` is a constant
+  expression, the Apply constructor has an empty body, and throttle and
+  the timing pair are inline no-ops, so every call in fuse_read and
+  fuse_write folds away at compile time and no branch, atomic load or
+  relocation survives into the binary.
+ */
+
+namespace qos
+{
+  constexpr
+  bool
+  enabled()
+  {
+    return false;
+  }
+
+  inline void enable(const bool) {}
+
+  class Apply
+  {
+  public:
+    inline
+    Apply(const fuse_req_ctx_t *,
+          const std::string *,
+          const Direction)
+    {
+    }
+
+    const Class   *cls() const { return nullptr; }
+    const RuleSet *ruleset() const { return nullptr; }
+  };
+
+  inline u64  timing_start(const Apply &) { return 0; }
+  inline void timing_end(const Apply &, const std::string &, const u64) {}
+  inline void throttle(const Apply &, const u64, const std::string &) {}
+
+  inline double pressure(const std::string &) { return 0.0; }
+  inline void   note_yielding(const std::string &) {}
+  inline u64    measured_capacity(const std::string &) { return 0; }
+  inline void   set_probed_capacity(const std::string &, const u64) {}
+  inline void   note_throughput(const std::string &, const u64) {}
+}
+
+#else
 
 namespace qos
 {
@@ -129,6 +186,81 @@ namespace qos
   // flat out on a disk nobody is streaming from.
   double pressure(const std::string &resource);
 
+  // ---- capacity -----------------------------------------------------
+  //
+  // What the daemon believes `resource` can deliver, in bytes/sec, or
+  // zero when it has no idea. This is the number a percentage rate is
+  // resolved against, and it is measured rather than declared.
+  //
+  // Two sources, in order of authority:
+  //
+  //   probed   -- an explicit O_DIRECT read probe (qos.calibrate),
+  //               which saturates the device and so measures a real
+  //               ceiling.
+  //   observed -- the best rate seen in a one second window that
+  //               carried enough requests to mean anything. Free, but
+  //               it can only ever see as much as was asked for, so it
+  //               reads as a floor on the true capacity.
+  //
+  // An explicit `capacity` line in the rules file still outranks both;
+  // see RuleSet::capacity().
+  u64  measured_capacity(const std::string &resource);
+  void set_probed_capacity(const std::string &resource, const u64 bytes_per_sec);
+
+  // Charges `bytes` against the resource's throughput window. Called
+  // for every request of every class, including the ones that are
+  // never throttled -- playback is the traffic that best shows what a
+  // disk can do, and excluding it would bias the estimate low.
+  void note_throughput(const std::string &resource, const u64 bytes);
+
+  // Snapshot of every resource the daemon has seen, for stats and for
+  // the mover's pacing decisions.
+  struct ResourceInfo
+  {
+    std::string name;
+    u64         observed;
+    u64         probed;
+    double      pressure;
+    bool        contended;
+    u64         latency_ewma_ns;
+    u64         latency_base_ns;
+    u64         distress_events;
+  };
+
+  std::vector<ResourceInfo> resources();
+
+  // Per-class counters and the descriptive bits a reader needs to
+  // interpret them. Snapshotted together so a consumer cannot see one
+  // class's numbers from before a reset and another's from after.
+  struct ClassInfo
+  {
+    std::string name;
+    u64         requests;
+    u64         bytes;
+    u64         throttled;
+    u64         throttled_ns;
+    u64         passed;
+    bool        protect;
+    bool        critical;
+    bool        govern;
+    u32         yield;
+  };
+
+  std::vector<ClassInfo> class_stats();
+
+  struct CoreInfo
+  {
+    bool        enabled;
+    int         sleepers;
+    int         max_sleepers;
+    u64         max_sleep_ms;
+    u64         distress_floor_ms;
+    double      distress_factor;
+    std::string rules_path;
+  };
+
+  CoreInfo core_info();
+
   // Records that a class willing to yield has just issued I/O against
   // a resource, which is what makes it count as contended.
   void note_yielding(const std::string &resource);
@@ -175,3 +307,5 @@ namespace qos
     const RuleSet *_rs  = nullptr;
   };
 }
+
+#endif

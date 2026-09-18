@@ -20,6 +20,29 @@
 
 #include "base_types.h"
 
+
+// Build-time feature flags. Defined by the build; defaulted here so
+// every qos header and source is self contained.
+#ifndef USE_QOS
+#define USE_QOS 1
+#endif
+
+#ifndef USE_QOS_GOVERN
+#define USE_QOS_GOVERN 1
+#endif
+
+#ifndef USE_QOS_CALIBRATE
+#define USE_QOS_CALIBRATE 1
+#endif
+
+#ifndef USE_QOS_MOVER
+#define USE_QOS_MOVER 1
+#endif
+
+#ifndef USE_QOS_GPU
+#define USE_QOS_GPU 1
+#endif
+
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -120,6 +143,27 @@ namespace qos
 
     // Counters for qos.stats.
     u64 distress_events = 0;
+
+    // ---- passive capacity measurement -------------------------------
+    //
+    // A percentage rate ("give the scanner 10% of this disk") means
+    // nothing until something knows what 100% is. Rather than require
+    // an offline benchmark to declare it, the daemon watches what the
+    // resource actually delivers.
+    //
+    // Deliberately outside `mutex`: every request of every class feeds
+    // this, including the protected and critical ones that take no
+    // other governor lock, and a window only rolls once a second.
+    std::atomic<u64> win_start{0};
+    std::atomic<u64> win_bytes{0};
+    std::atomic<u64> win_reqs{0};
+
+    // Best rate seen in a window busy enough to mean anything, and the
+    // ceiling an active probe measured. `probed` wins when set: a
+    // saturating O_DIRECT read is a true ceiling, whereas observation
+    // can only ever see as much as was asked for.
+    std::atomic<u64> observed{0};
+    std::atomic<u64> probed{0};
   };
 
   // A QoS class is a named bundle of scheduling parameters plus the
@@ -169,6 +213,37 @@ namespace qos
 
     // True when this class must never be delayed for any reason.
     bool immune() const { return (protect || critical); }
+
+    // Apply this class's nice and ioprio to the *client process*
+    // itself, not only to the worker thread serving its pool I/O.
+    //
+    // Pool I/O is flattened through the daemon, which is what the rest
+    // of this file exists to undo -- but a media server also reads and
+    // writes outside the pool (its own database, its transcode
+    // scratch, its metadata store), and that I/O the kernel really
+    // does attribute to the process. Governing the process covers
+    // that half, and covers CPU scheduling, which FUSE does not
+    // flatten at all.
+    //
+    // Opt-in per class because it reaches outside the daemon: nothing
+    // touches a process that was not asked for by name.
+    bool govern = false;
+
+    // What the governor applies to the process, when that should differ
+    // from what the worker thread gets for the process's pool I/O.
+    //
+    // The two are different axes. ffprobe is the canonical case: its
+    // pool reads are a synchronous dependency of starting playback and
+    // must never be throttled (`critical`), while its CPU is pure
+    // library analysis that should sit at the bottom of the scheduler.
+    // UNSET means "same as ioprio / nice".
+    int govern_ioprio = qos::UNSET;
+    int govern_nice   = qos::UNSET;
+
+    int effective_govern_ioprio() const
+    { return ((govern_ioprio != qos::UNSET) ? govern_ioprio : ioprio); }
+    int effective_govern_nice() const
+    { return ((govern_nice != qos::UNSET) ? govern_nice : nice); }
 
     // How strongly this class gives way as pressure rises, 0-100.
     // 0 never yields; 100 yields its whole allowance at full

@@ -18,6 +18,9 @@
 
 #include "qos_class.hpp"
 
+#if USE_QOS
+
+
 
 qos::Bucket *
 qos::Class::bucket_for(const std::string &resource_) const
@@ -35,3 +38,5 @@ qos::Class::bucket_for(const std::string &resource_) const
 
   return it->second.get();
 }
+
+#endif

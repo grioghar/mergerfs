@@ -46,6 +46,11 @@ The two are independent and there is no reason to enable both.
 | `qos.max-sleep-ms` | `50` | longest any one request may be delayed |
 | `qos.distress-ms` | `50` | service time below which a protected class is never considered to be suffering |
 | `qos.distress-factor` | `3.0` | multiple of a resource's quiet latency that counts as distress |
+| `qos.stats.json` | - | read only: all of the above, plus the governor, mover, GPU and calibration state, as one JSON document |
+| `qos.calibrate` | - | assign `<seconds>[,write]` to measure what each branch delivers; read for progress |
+| `qos.govern` | `0` | seconds between sweeps applying `govern` classes to client processes; `0` is off |
+| `qos.gpu` | `0` | `<percent>[,<floor>]`: hold pressure at `floor` while the GPU is at least this busy; `0` is off |
+| `qos.mover` | `policy=off` | background relocation of existing files; see [The mover](#the-mover) |
 
 Every one of these is readable and writable at runtime through the
 [runtime interface](../runtime_interface.md):
@@ -94,6 +99,7 @@ wins. A class must be defined before a rule names it.
 | `critical` | never throttled, and *not* a control signal |
 | `yield=` | `0`-`100`: how hard this class gives way under pressure |
 | `floor=` | never back off below this; absolute or a percentage |
+| `govern` | also apply this class's `ioprio` and `nice` to the client process itself; see [The process governor](#the-process-governor) |
 
 ### Match fields
 
@@ -170,15 +176,45 @@ token bucket per branch, so a class limited to 10% gets a tenth of
 Two players reading two different disks never compete for one
 allowance.
 
-Percentages need a capacity to resolve against. Measure it:
+Percentages need a capacity to resolve against, and mergerfs works it
+out for itself. There are three sources, in order of authority:
+
+1. **A `capacity` line in the rules file.** An explicit statement of
+   what a disk is for. Nothing overrules it.
+2. **An active probe.** `qos.calibrate` saturates each branch with
+   O_DIRECT reads and records a real ceiling.
+3. **Passive observation.** Always running and free: the best rate seen
+   in a one second window that carried enough requests to mean
+   anything. It rises immediately, decays slowly, and does not decay at
+   all while the pool is idle -- so an overnight quiet spell cannot
+   erase what the pool managed under load.
+
+Observation can only ever see as much as something asked for, so on a
+pool that has never been driven hard it reads low. That is what the
+probe is for:
 
 ```sh
-mergerfs.qos-bench /mnt/pool -o /etc/mergerfs/qos.capacity
+# three seconds per branch, reads only
+setfattr -n user.mergerfs.qos.calibrate -v 3 /mnt/pool/.mergerfs
+
+# ...and measure writes too, via a temporary file on each branch
+setfattr -n user.mergerfs.qos.calibrate -v 3,write /mnt/pool/.mergerfs
+
+getfattr -n user.mergerfs.qos.calibrate --only-values /mnt/pool/.mergerfs
 ```
 
-and include those lines in the rules file. A percentage with no
-capacity declared for its resource is left unlimited rather than
-throttled against a guess.
+It runs in the background -- the assignment returns immediately -- one
+branch at a time, at `nice 19` and idle I/O priority, reading with
+O_DIRECT so it neither measures the page cache nor evicts anything the
+running services still want. Results are installed per branch as they
+are measured.
+
+Because it yields rather than competes, a figure measured while the
+pool is busy is a floor rather than a ceiling. Calibrate when it is
+quiet.
+
+A percentage with no capacity known for its resource is left unlimited
+rather than throttled against a guess.
 
 
 ## The adaptive governor
@@ -211,6 +247,173 @@ never engage -- use single-digit milliseconds there. Setting it to `0`
 removes noise suppression entirely and is not recommended.
 
 
+## The process governor
+
+Everything above governs I/O that flows *through* mergerfs. A media
+server also reads and writes outside the pool -- its own database, its
+metadata store, its transcode scratch directory -- and it burns CPU.
+Neither is flattened by FUSE, and both compete with playback.
+
+Marking a class `govern` applies its `ioprio` and `nice` to the client
+process itself, not only to the worker thread serving its pool I/O:
+
+```
+class downloads govern yield=100 floor=5% ioprio=idle nice=19
+```
+
+```sh
+# sweep every 10 seconds
+setfattr -n user.mergerfs.qos.govern -v 10 /mnt/pool/.mergerfs
+getfattr -n user.mergerfs.qos.govern --only-values /mnt/pool/.mergerfs
+```
+
+This replaces the shell loop calling `renice` and `ionice` that pools
+of this kind usually end up with. Doing it here means one ruleset
+describes both halves of the problem instead of two that drift apart,
+and it avoids the trap that `pgrep` walks into: `comm` is capped at
+fifteen characters and frequently does not resemble the command line,
+so `pgrep -x` silently matches nothing for a name any longer than that.
+The matching here already understands full command lines.
+
+Details that matter:
+
+* **Every thread of a matched process is set**, not just its main
+  thread. `nice` and `ioprio` are per-thread values on Linux, and a
+  server that does its scanning on a worker thread is the normal case.
+* **Steady state costs nothing.** A process is only touched when its
+  class changes or it has spawned threads since the last sweep.
+* **mergerfs never governs itself.** Its threads are set per request;
+  a sweep would fight that every interval.
+* `path` and `op` conditions cannot be evaluated outside a request, so
+  rules using them never match here and classification falls through
+  to the next rule. Do not mark such a class `govern` and expect it to
+  work.
+* Lowering another process's `nice` needs privilege. Threads that
+  could not be set are counted in `failed`.
+
+
+## The GPU signal
+
+On a media server the video engine is busy exactly when hardware
+transcodes are running -- which is to say, when somebody is watching
+something. That is evidence the disk-side signals cannot see on their
+own:
+
+* A player with a full buffer issues no reads at all for seconds at a
+  time. The contention window reads that silence as "nobody is
+  streaming", which is precisely when a download would be let back up
+  to full speed and the next buffer refill would stutter.
+* A saturated video engine means further transcodes fall back to
+  software, changing both the CPU picture and the read pattern.
+
+```sh
+# while the GPU is >=70% busy, hold pressure at no less than 0.5
+setfattr -n user.mergerfs.qos.gpu -v 70,0.5 /mnt/pool/.mergerfs
+```
+
+This contributes a *floor* under the governor's pressure rather than a
+term in its feedback: while the engine is busy, yielding classes never
+return to full speed however quiet the disks look. The latency loop
+still runs on top and can push pressure higher. The floor applies only
+to branches that were streamed from in the last minute, so a disk
+nobody has touched is never throttled on account of a transcode
+elsewhere.
+
+The source is the amdgpu sysfs busy counter. There is no driver,
+library or link time dependency in any configuration -- it opens a file
+in `/sys` and parses an integer. Intel i915 and NVIDIA do not publish
+an equivalent single percentage there; on those, and on a host with no
+GPU, `qos.gpu` reports unsupported and assigning a non-zero threshold
+fails with `EOPNOTSUPP` rather than silently doing nothing.
+
+**The GPU is not used to make scheduling decisions, and should not be.**
+Classifying a request is a string match costing a few hundred
+nanoseconds; a dispatch to a device costs tens of microseconds before
+any work begins. On a code path whose whole purpose is protecting
+playback latency that trade is backwards. The GPU here is an input,
+never a processor.
+
+
+## The mover
+
+The `balance` option steers new creates towards the branches that are
+behind, which levels a pool over time but only as fast as new data
+arrives -- a disk that is already full stays full. The mover relocates
+data that is already written. The two are complementary and there is
+no reason not to run both.
+
+```sh
+setfattr -n user.mergerfs.qos.mover \
+  -v 'policy=percent-full,high=90,low=85,interval=300' /mnt/pool/.mergerfs
+
+getfattr -n user.mergerfs.qos.mover --only-values /mnt/pool/.mergerfs
+```
+
+| key | default | meaning |
+|---|---|---|
+| `policy` | `off` | `off`, `percent-full` or `time-based` |
+| `interval` | `60` | seconds between passes |
+| `high` | `90` | percent full at which a branch starts shedding |
+| `low` | `85` | the level the pool is being levelled towards |
+| `age` | `90` | `time-based`: days since last access |
+| `from`, `to` | - | `time-based`: source and destination branch paths |
+| `pressure` | `0.05` | pause while either end is under more backoff than this |
+| `rate` | `0` | cap, e.g. `50M`; `0` is unlimited |
+| `max-files` | `0` | per pass; `0` is unlimited |
+
+Keys not given keep their current values, so one can be adjusted
+without restating the rest.
+
+`percent-full` moves the largest files off the fullest branch onto the
+emptiest one that has room, stopping when the source reaches `low` *or*
+the destination rises to `low`, whichever comes first. `time-based`
+moves files not accessed in `age` days from `from` to `to`, coldest
+first -- cold media off the fast disk, or off a disk about to be
+retired.
+
+### Why this belongs in the daemon
+
+A mover is a bulk sequential reader and writer hitting two disks at
+once, which is the single most disruptive thing that can happen to a
+pool somebody is streaming from. An external script has no way to know
+when that is, so it gets scheduled for 3am and hoped for.
+
+The daemon already knows. The mover consults the same per-branch
+pressure signal the governor controls against, and it announces its own
+traffic as yielding -- necessary, because it reads and writes the
+branches directly and never passes through the FUSE path, so nothing
+would otherwise tell the governor there was anything here willing to
+give way. The result is a mover that runs flat out when the pool is
+quiet and gets out of the way within a second or two of somebody
+pressing play, with no schedule and no playback detection of its own.
+
+It also runs at `nice 19` and idle I/O priority, and `rate` is there
+for the case where the destination is fast enough that nothing ever
+registers as contended.
+
+### Safety
+
+This is the only part of mergerfs that deletes data, so:
+
+* Copy, verify, rename, and only then unlink the source. A source that
+  changed underneath the copy is re-copied rather than trusted.
+* **A file with more than one link is never moved.** Copying it would
+  silently split the hardlink into two independent files, and nothing
+  afterwards can put that back together.
+* **A path that already exists on the destination is skipped**, never
+  overwritten. Resolving a duplicate by picking a winner is not a
+  decision this makes silently. These are counted in `skipped`, not
+  `errors`.
+* Never onto a branch that is RO or NC, or that lacks room for the file
+  plus its `minfreespace`.
+* A process holding the file open keeps reading the copy it already
+  has, by ordinary unlink semantics. It sees no error.
+
+If `moved` stays at zero, read `skipped` and `last-error`. The usual
+cause is [minfreespace](minfreespace.md), which defaults to 4GiB: a
+destination branch smaller than that never accepts anything.
+
+
 ## Example
 
 ```
@@ -227,8 +430,10 @@ class helpers   critical
 # and credits detection -- yields, but gently.
 class scanning  yield=60  floor=10% ioprio=be:6 nice=10
 
-# Downloads yield first and hardest, but never stop.
-class downloads yield=100 floor=5%  ioprio=idle nice=19
+# Downloads yield first and hardest, but never stop. `govern` also
+# pins the downloader's own process to the bottom of both schedulers,
+# which covers the I/O it does outside the pool.
+class downloads govern yield=100 floor=5%  ioprio=idle nice=19
 
 # Audio helpers first: a transcode blocks on these.
 match comm ~ EasyAudioEncode*                     -> helpers
@@ -254,6 +459,18 @@ match comm ~ qbittorrent*                         -> downloads
 match comm ~ sabnzbd*                             -> downloads
 
 default scanning
+```
+
+With that loaded, a working configuration for a media pool is:
+
+```sh
+ctl=/mnt/pool/.mergerfs
+
+setfattr -n user.mergerfs.qos.rules    -v /etc/mergerfs/qos.rules "$ctl"
+setfattr -n user.mergerfs.qos.calibrate -v 3 "$ctl"   # once, while quiet
+setfattr -n user.mergerfs.qos.govern   -v 10 "$ctl"
+setfattr -n user.mergerfs.qos.gpu      -v 70,0.5 "$ctl"
+setfattr -n user.mergerfs.qos.mover    -v 'policy=percent-full,interval=300' "$ctl"
 ```
 
 A client that reads the pool over NFS or SMB -- Kodi on another
@@ -308,10 +525,40 @@ onto a different class inside that window is briefly misclassified.
 **Only reads and writes are governed.** Metadata operations are not,
 being neither large nor slow enough to be worth the syscalls.
 
-**Direct access to a branch is invisible.** Anything reading or writing
-`/mnt/disk1` rather than the pool never reaches mergerfs and cannot be
-classified. Rebalance scripts and the like need the host's own
-`ionice`.
+**Direct access to a branch is still invisible.** Anything reading or
+writing `/mnt/disk1` rather than the pool never reaches mergerfs and
+cannot be classified per request. Two things now narrow this:
+[the process governor](#the-process-governor) sets the offending
+process's own `nice` and `ioprio`, which is what the kernel *can* act
+on for I/O it issues directly; and [the mover](#the-mover), the usual
+reason a rebalance script existed, is now inside the daemon and
+announces its traffic to the governor. A third party tool writing to a
+branch behind mergerfs's back remains outside all of this.
+
+
+## Build options
+
+Every piece of this can be compiled out. `USE_QOS=0` removes the
+subsystem outright -- the read and write paths lose their `qos::Apply`,
+throttle and timing calls entirely rather than branching past them, so
+a build that does not want any of it pays nothing for it.
+
+| flag | default | removes |
+|---|---|---|
+| `USE_QOS=0` | `1` | the whole subsystem, including the hot path |
+| `USE_QOS_GOVERN=0` | `1` | the client process governor |
+| `USE_QOS_CALIBRATE=0` | `1` | the active capacity probe (passive measurement stays) |
+| `USE_QOS_MOVER=0` | `1` | the background file mover |
+| `USE_QOS_GPU=0` | `1` | the GPU signal |
+
+```sh
+make USE_QOS_GPU=0 USE_QOS_MOVER=0
+```
+
+The `qos.*` runtime keys stay registered in every configuration, so a
+caller gets a clear "unsupported" rather than an unknown-key error that
+looks like a typo. Every sub-feature is also off at runtime by default,
+so enabling them is always a deliberate act.
 
 
 ## Supported platforms

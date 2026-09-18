@@ -175,6 +175,11 @@ public:
   QoSDistressFactor qos_distress_factor;
   QoSMaxSleepers qos_max_sleepers;
   QoSMaxSleepMS  qos_max_sleep_ms;
+  QoSCalibrate   qos_calibrate;
+  QoSGovern      qos_govern;
+  QoSGPU         qos_gpu;
+  QoSMover       qos_mover;
+  QoSStatsJSON   qos_stats_json;
   TFSRef<int>    read_thread_count;
   ConfigU64      readahead;
   FUSE::ReadDir  readdir;

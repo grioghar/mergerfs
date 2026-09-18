@@ -116,15 +116,23 @@ namespace qos
 
     const Class *find_class(const std::string_view name) const;
 
-    // Measured or declared throughput of `resource` in bytes/sec,
-    // falling back to the `capacity default` line. Zero when nothing
-    // is known, which makes percentage rates unenforceable and is
-    // reported as such.
-    u64 capacity(const std::string &resource) const;
+    // Declared throughput of `resource` in bytes/sec, falling back to
+    // the `capacity default` line and then to `measured` -- what the
+    // daemon has watched the resource actually deliver.
+    //
+    // A declared figure wins over a measured one on purpose: an
+    // explicit `capacity` line is somebody stating what this disk is
+    // for, and measurement should not quietly overrule it. Zero when
+    // nothing is known either way, which makes percentage rates
+    // unenforceable and is reported as such.
+    u64 capacity(const std::string &resource,
+                 const u64          measured = 0) const;
 
     // Resolves a class's configured rate against the resource
     // serving the request. Returns 0 for "unlimited".
-    u64 rate_for(const Class *, const std::string &resource) const;
+    u64 rate_for(const Class       *,
+                 const std::string &resource,
+                 const u64          measured = 0) const;
 
     // True when no rule and no class can change a thread's behaviour,
     // letting the hot path skip reading /proc entirely.
@@ -141,8 +149,18 @@ namespace qos
     // the adaptive governor on.
     bool has_protected() const { return _has_protected; }
 
+    // True when some class is marked `govern` and has a value to
+    // apply, which is what makes walking /proc worth doing.
+    bool has_govern() const { return _has_govern; }
+
     // Resolves a class's floor against the resource.
-    u64 floor_for(const Class *, const std::string &resource) const;
+    u64 floor_for(const Class       *,
+                  const std::string &resource,
+                  const u64          measured = 0) const;
+
+    // True when some class resolves a rate or a floor as a percentage,
+    // which is what makes a capacity figure worth measuring at all.
+    bool needs_capacity() const { return _needs_capacity; }
 
     const std::vector<std::unique_ptr<Class>> &classes() const { return _classes; }
 
@@ -160,6 +178,8 @@ namespace qos
     bool                                   _needs_cmdline = false;
     bool                                   _needs_path = false;
     bool                                   _has_protected = false;
+    bool                                   _needs_capacity = false;
+    bool                                   _has_govern = false;
   };
 
   // Parses "10M", "1.5MiB", "512K", "1G" and bare byte counts into

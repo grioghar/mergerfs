@@ -94,6 +94,20 @@ crontab entry:
 0 * * * * /usr/local/bin/mergerfs.time-based-mover /mnt/ssd/cache00 /mnt/base-pool 1
 ```
 
+**Alternatively**, mergerfs can do this itself. `qos.mover` with
+`policy=time-based` performs the same relocation from inside the
+daemon, paced by the QoS governor so it yields to playback rather than
+to a cron schedule:
+
+```sh
+setfattr -n user.mergerfs.qos.mover \
+  -v 'policy=time-based,from=/mnt/ssd/cache00,to=/mnt/hdd00,age=1,interval=3600' \
+  /mnt/base-pool/.mergerfs
+```
+
+`from` and `to` are branch paths, exactly as with the script.
+See [qos](config/qos.md#the-mover).
+
 If you have more than one cache filesystem then simply add a cron
 entry for each.
 
@@ -129,6 +143,18 @@ crontab entry:
 # m h  dom mon dow   command
 0 * * * * /usr/local/bin/mergerfs.percent-full-mover /mnt/ssd/cache00 /mnt/base-pool 80
 ```
+
+**Alternatively**, `qos.mover` with `policy=percent-full` does this
+inside the daemon, choosing the fullest and emptiest branches itself
+and backing off while the pool is being read:
+
+```sh
+setfattr -n user.mergerfs.qos.mover \
+  -v 'policy=percent-full,high=80,low=70,interval=3600' \
+  /mnt/base-pool/.mergerfs
+```
+
+See [qos](config/qos.md#the-mover).
 
 If you have more than one cache filesystem then simply add a cron
 entry for each.

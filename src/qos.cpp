@@ -18,9 +18,13 @@
 
 #include "qos.hpp"
 
+#if USE_QOS
+
+
 #include "config.hpp"
 #include "ioprio.hpp"
 #include "procfs.hpp"
+#include "qos_gpu.hpp"
 
 #include "fmt/core.h"
 
@@ -33,6 +37,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -84,6 +89,20 @@ namespace
   // classes go back to full speed.
   constexpr u64 CONTENTION_WINDOW_NS = 2 * NS_PER_SEC;
 
+  // How recently a protected class must have touched a resource for
+  // the GPU signal to still apply to it.
+  //
+  // Much longer than the contention window on purpose. A player with a
+  // full buffer issues no reads at all for seconds at a time, and the
+  // contention window alone reads that silence as "nobody is
+  // streaming" -- which is exactly when a download would be let back
+  // up to full speed and the next buffer refill would stutter. A busy
+  // video engine is independent evidence that playback is still going
+  // on, and this is how long that evidence is allowed to speak for a
+  // given disk. Still bounded, so a disk nobody has streamed from in
+  // a minute is never throttled on account of a transcode elsewhere.
+  constexpr u64 GPU_PROTECTED_WINDOW_NS = 60 * NS_PER_SEC;
+
   // A protected request is "in distress" when the smoothed service
   // time exceeds this multiple of the quietest time the same resource
   // has managed -- but never below the absolute floor, so ordinary
@@ -95,26 +114,110 @@ namespace
   constexpr double PRESSURE_UP_STEP   = 0.10;
   constexpr double PRESSURE_DOWN_PER_SEC = 0.20;
 
-  std::mutex g_gov_mutex;
+  // ---- capacity measurement ----------------------------------------
+
+  constexpr u64 CAPACITY_WINDOW_NS = NS_PER_SEC;
+
+  // A window has to have carried real traffic before its rate says
+  // anything about what the device can do: one 128KiB read in an
+  // otherwise idle second is 128KB/s of demand, not of capacity.
+  constexpr u64 CAPACITY_MIN_REQS = 8;
+
+  // How fast a busy window that fails to match the high-water mark
+  // drags it down: ~0.4% per busy second. A disk that has genuinely
+  // slowed -- a failing spindle, a resilvering array -- is tracked
+  // within a few minutes, while a lull in the middle of a stream is
+  // not mistaken for degradation. Idle windows do not decay it at all,
+  // so an overnight quiet spell cannot erase what the pool managed
+  // under load.
+  constexpr u64 CAPACITY_DECAY_SHIFT = 8;
+
+  // Shared rather than exclusive because every request now looks a
+  // governor up -- capacity is measured from all traffic, not just the
+  // classes that take a governor lock for other reasons. Insertion
+  // happens once per branch and lookup happens millions of times.
+  std::shared_mutex g_gov_mutex;
 
   // Governor state is keyed by resource and deliberately outlives
   // ruleset reloads: what a disk is doing does not change because
-  // somebody edited a rules file.
+  // somebody edited a rules file. Nothing is ever erased, so a pointer
+  // handed out here stays valid for the life of the mount.
   std::unordered_map<std::string,std::unique_ptr<qos::Governor>> g_governors;
 
   qos::Governor *
   _governor_for(const std::string &resource_)
   {
-    std::lock_guard<std::mutex> lk(g_gov_mutex);
+    {
+      std::shared_lock<std::shared_mutex> lk(g_gov_mutex);
 
-    auto i = g_governors.find(resource_);
-    if(i != g_governors.end())
-      return i->second.get();
+      auto i = g_governors.find(resource_);
+      if(i != g_governors.end())
+        return i->second.get();
+    }
+
+    std::lock_guard<std::shared_mutex> lk(g_gov_mutex);
 
     auto [it,inserted] = g_governors.emplace(resource_,
                                              std::make_unique<qos::Governor>());
 
     return it->second.get();
+  }
+
+  // Folds one request into the resource's throughput window and, once
+  // a second, turns the window into a capacity estimate.
+  //
+  // Lock free on purpose. This runs for every request of every class,
+  // including protected ones that otherwise touch no governor state,
+  // so paying a mutex here would put a contention point on the hot
+  // path purely for bookkeeping.
+  void
+  _note_throughput(qos::Governor *g_,
+                   const u64      bytes_,
+                   const u64      now_)
+  {
+    g_->win_bytes.fetch_add(bytes_,std::memory_order_relaxed);
+    g_->win_reqs.fetch_add(1,std::memory_order_relaxed);
+
+    u64 start = g_->win_start.load(std::memory_order_relaxed);
+
+    if(start == 0)
+      {
+        g_->win_start.compare_exchange_strong(start,now_,
+                                              std::memory_order_relaxed);
+        return;
+      }
+
+    if((now_ - start) < CAPACITY_WINDOW_NS)
+      return;
+
+    // Exactly one thread rolls the window; the losers of this exchange
+    // simply accumulate into the next one. A few bytes added between
+    // the comparison above and the exchanges below land in the wrong
+    // window, which at these sample sizes is noise.
+    if(!g_->win_start.compare_exchange_strong(start,now_,
+                                              std::memory_order_relaxed))
+      return;
+
+    const u64 bytes   = g_->win_bytes.exchange(0,std::memory_order_relaxed);
+    const u64 reqs    = g_->win_reqs.exchange(0,std::memory_order_relaxed);
+    const u64 elapsed = (now_ - start);
+
+    if((reqs < CAPACITY_MIN_REQS) || (elapsed == 0))
+      return;
+
+    const u64 rate = static_cast<u64>((static_cast<unsigned __int128>(bytes) *
+                                       NS_PER_SEC) / elapsed);
+
+    const u64 observed = g_->observed.load(std::memory_order_relaxed);
+
+    // Up immediately, down slowly. The best rate ever seen is the
+    // closest thing to a ceiling passive observation can offer, so it
+    // is believed at once and surrendered reluctantly.
+    if(rate > observed)
+      g_->observed.store(rate,std::memory_order_relaxed);
+    else
+      g_->observed.store(observed - (observed >> CAPACITY_DECAY_SHIFT),
+                         std::memory_order_relaxed);
   }
 
   std::mutex          g_mutex;
@@ -403,6 +506,113 @@ qos::timing_end(const Apply       &apply_,
   g->updated_at = now;
 }
 
+u64
+qos::measured_capacity(const std::string &resource_)
+{
+  qos::Governor *g = ::_governor_for(resource_);
+
+  const u64 probed = g->probed.load(std::memory_order_relaxed);
+
+  if(probed != 0)
+    return probed;
+
+  return g->observed.load(std::memory_order_relaxed);
+}
+
+void
+qos::set_probed_capacity(const std::string &resource_,
+                         const u64          bps_)
+{
+  qos::Governor *g = ::_governor_for(resource_);
+
+  g->probed.store(bps_,std::memory_order_relaxed);
+}
+
+void
+qos::note_throughput(const std::string &resource_,
+                     const u64          bytes_)
+{
+  ::_note_throughput(::_governor_for(resource_),bytes_,::_now_ns());
+}
+
+std::vector<qos::ResourceInfo>
+qos::resources()
+{
+  std::vector<qos::ResourceInfo> rv;
+
+  std::shared_lock<std::shared_mutex> lk(g_gov_mutex);
+
+  const u64 now = ::_now_ns();
+
+  rv.reserve(g_governors.size());
+
+  for(const auto &[resource,g] : g_governors)
+    {
+      std::lock_guard<std::mutex> glk(g->mutex);
+
+      const bool contended = (g->protected_at &&
+                              ((now - g->protected_at) <= CONTENTION_WINDOW_NS));
+
+      rv.push_back({resource,
+                    g->observed.load(std::memory_order_relaxed),
+                    g->probed.load(std::memory_order_relaxed),
+                    (contended ? g->pressure : 0.0),
+                    contended,
+                    g->latency_ewma,
+                    g->latency_base,
+                    g->distress_events});
+    }
+
+  return rv;
+}
+
+std::vector<qos::ClassInfo>
+qos::class_stats()
+{
+  std::vector<qos::ClassInfo> rv;
+
+  RuleSet::Ptr rs = qos::ruleset();
+
+  if(rs == nullptr)
+    return rv;
+
+  rv.reserve(rs->classes().size());
+
+  for(const auto &c : rs->classes())
+    {
+      rv.push_back({c->name,
+                    c->requests.load(std::memory_order_relaxed),
+                    c->bytes.load(std::memory_order_relaxed),
+                    c->throttled.load(std::memory_order_relaxed),
+                    c->throttled_ns.load(std::memory_order_relaxed),
+                    c->passed.load(std::memory_order_relaxed),
+                    c->protect,
+                    c->critical,
+                    c->govern,
+                    c->yield});
+    }
+
+  return rv;
+}
+
+qos::CoreInfo
+qos::core_info()
+{
+  qos::CoreInfo rv;
+
+  rv.enabled           = qos::enabled();
+  rv.sleepers          = g_sleepers.load(std::memory_order_relaxed);
+  rv.max_sleepers      = ::_sleeper_limit();
+  rv.max_sleep_ms      = (qos::max_sleep_ns.load(std::memory_order_relaxed) /
+                          (1000 * 1000));
+  rv.distress_floor_ms = (qos::distress_floor_ns.load(std::memory_order_relaxed) /
+                          (1000 * 1000));
+  rv.distress_factor   = qos::distress_factor.load(std::memory_order_relaxed);
+  rv.rules_path        = qos::rules_path();
+
+  return rv;
+}
+
 void
 qos::note_yielding(const std::string &resource_)
 {
@@ -424,12 +634,25 @@ qos::pressure(const std::string &resource_)
 
   std::lock_guard<std::mutex> lk(g->mutex);
 
+  const double gpu_floor = qos::gpu::pressure_floor();
+
   // Nobody has been streaming off this resource lately, so there is
-  // nothing to protect and nothing to yield to.
+  // nothing to protect and nothing to yield to -- unless the video
+  // engine says otherwise, and this disk is one that was being played
+  // from recently enough for that to be about this disk.
   if((g->protected_at == 0) ||
      ((now - g->protected_at) > CONTENTION_WINDOW_NS))
     {
+      // The latency loop genuinely has no signal here, so its own
+      // pressure is zero. The floor is applied on top of that rather
+      // than stored, so it disappears the moment the engine goes idle.
       g->pressure = 0.0;
+
+      if((gpu_floor > 0.0) &&
+         g->protected_at &&
+         ((now - g->protected_at) <= GPU_PROTECTED_WINDOW_NS))
+        return gpu_floor;
+
       return 0.0;
     }
 
@@ -448,7 +671,7 @@ qos::pressure(const std::string &resource_)
         }
     }
 
-  return g->pressure;
+  return std::max(g->pressure,gpu_floor);
 }
 
 void
@@ -464,6 +687,30 @@ qos::throttle(const Apply       &apply_,
   cls->requests.fetch_add(1,std::memory_order_relaxed);
   cls->bytes.fetch_add(bytes_,std::memory_order_relaxed);
 
+  const RuleSet *rs = apply_.ruleset();
+
+  // Capacity is measured from all traffic, protected and critical
+  // included, and so is sampled before the early returns below: a
+  // player streaming flat out is the best evidence of what a disk can
+  // do, and leaving it out would bias every percentage rate low.
+  //
+  // A ruleset that resolves nothing against capacity pays nothing for
+  // this -- no governor lookup, no clock read.
+  u64 measured = 0;
+
+  if((rs != nullptr) && rs->needs_capacity())
+    {
+      qos::Governor *gov = ::_governor_for(resource_);
+
+      ::_note_throughput(gov,bytes_,::_now_ns());
+
+      const u64 probed = gov->probed.load(std::memory_order_relaxed);
+
+      measured = (probed
+                  ? probed
+                  : gov->observed.load(std::memory_order_relaxed));
+    }
+
   // Protected traffic and critical dependencies are never delayed,
   // whatever else the ruleset says about them. Checked before any
   // rate is even resolved so a `rate=` accidentally left on such a
@@ -477,14 +724,13 @@ qos::throttle(const Apply       &apply_,
   if(!cls->limited() && !cls->adaptive())
     return;
 
-  const RuleSet *rs = apply_.ruleset();
   if(rs == nullptr)
     return;
 
   // A percentage only becomes a number once the serving branch is
   // known, so the rate is resolved per request rather than at parse
   // time.
-  u64 rate = rs->rate_for(cls,resource_);
+  u64 rate = rs->rate_for(cls,resource_,measured);
 
   if(cls->adaptive())
     {
@@ -511,7 +757,7 @@ qos::throttle(const Apply       &apply_,
           // class is measured against the resource's capacity; with no
           // capacity declared there is nothing to compute against and
           // it stays unlimited.
-              const u64 base = (rate ? rate : rs->capacity(resource_));
+              const u64 base = (rate ? rate : rs->capacity(resource_,measured));
 
           if(base == 0)
             return;
@@ -521,7 +767,7 @@ qos::throttle(const Apply       &apply_,
 
           // Yielding must never mean stopping: a floored class keeps
           // making progress, just slowly.
-          const u64 floor = rs->floor_for(cls,resource_);
+          const u64 floor = rs->floor_for(cls,resource_,measured);
           if(scaled < floor)
             scaled = floor;
           if(scaled == 0)
@@ -710,6 +956,8 @@ qos::stats()
   if(rs == nullptr)
     return {};
 
+  out += fmt::format("gpu: {}",qos::gpu::status());
+
   out += fmt::format("enabled={} sleepers-in-flight={} max-sleepers={} "
                      "max-sleep-ms={}\n",
                      (qos::enabled() ? "true" : "false"),
@@ -719,7 +967,7 @@ qos::stats()
                       (1000 * 1000)));
 
   {
-    std::lock_guard<std::mutex> lk(g_gov_mutex);
+    std::shared_lock<std::shared_mutex> lk(g_gov_mutex);
     const u64 now = ::_now_ns();
 
     for(const auto &[resource,g] : g_governors)
@@ -730,13 +978,16 @@ qos::stats()
                                 ((now - g->protected_at) <= CONTENTION_WINDOW_NS));
 
         out += fmt::format("resource {}: contended={} pressure={:.2f} "
-                           "latency-ms={:.1f} baseline-ms={:.1f} distress={}\n",
+                           "latency-ms={:.1f} baseline-ms={:.1f} distress={} "
+                           "observed-bps={} probed-bps={}\n",
                            resource,
                            (contended ? "yes" : "no"),
                            (contended ? g->pressure : 0.0),
                            (static_cast<double>(g->latency_ewma) / 1000000.0),
                            (static_cast<double>(g->latency_base) / 1000000.0),
-                           g->distress_events);
+                           g->distress_events,
+                           g->observed.load(std::memory_order_relaxed),
+                           g->probed.load(std::memory_order_relaxed));
       }
   }
 
@@ -773,3 +1024,5 @@ qos::reset_stats()
       c->passed.store(0,std::memory_order_relaxed);
     }
 }
+
+#endif

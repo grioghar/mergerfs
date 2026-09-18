@@ -31,6 +31,8 @@
 #include "oom.hpp"
 #include "option_parser.hpp"
 #include "procfs.hpp"
+#include "qos_govern.hpp"
+#include "qos_mover.hpp"
 #include "resources.hpp"
 #include "strvec.hpp"
 #include "syslog.hpp"
@@ -372,6 +374,13 @@ _main(int    argc_,
                  &ops);
 
   SysLog::info("exiting main loop with return code {}",rv);
+
+  // The QoS background threads outlive the FUSE loop otherwise. A
+  // std::thread that is still joinable when its storage is destroyed
+  // calls std::terminate, so the process would abort on the way out of
+  // an otherwise clean unmount.
+  qos::govern::stop();
+  qos::mover::stop();
 
   SysLog::close();
 
