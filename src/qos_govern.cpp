@@ -77,6 +77,10 @@ namespace
   std::atomic<u64>                       g_interval{0};
   std::unordered_map<pid_t,Applied>      g_applied;
 
+  constexpr std::size_t          MAX_PROCS = 64;
+  std::vector<qos::govern::Proc> g_procs;
+  std::vector<qos::govern::Proc> g_procs_next;
+
   // Last sweep's summary, for the status key.
   u64 g_sweeps    = 0;
   u64 g_examined  = 0;
@@ -199,6 +203,8 @@ namespace
     for(auto &[pid,a] : g_applied)
       a.seen = false;
 
+    g_procs_next.clear();
+
     struct dirent *de;
     while((de = ::readdir(d)) != nullptr)
       {
@@ -266,6 +272,13 @@ namespace
 
         matched++;
 
+        if(g_procs_next.size() < MAX_PROCS)
+          g_procs_next.push_back({static_cast<int>(pid),
+                                  (comm.empty() ? procfs::get_name(pid) : comm),
+                                  cls->name,
+                                  cls->effective_govern_nice(),
+                                  cls->effective_govern_ioprio()});
+
         const std::vector<pid_t> tasks = ::_tasks_of(pid);
         if(tasks.empty())
           continue;
@@ -293,6 +306,8 @@ namespace
     // not accumulate an entry per pid the machine has ever run.
     for(auto i = g_applied.begin(); i != g_applied.end(); )
       i = (i->second.seen ? std::next(i) : g_applied.erase(i));
+
+    g_procs.swap(g_procs_next);
 
     g_sweeps++;
     g_examined = examined;
@@ -430,6 +445,14 @@ qos::govern::stats()
           g_failed};
 }
 
+std::vector<qos::govern::Proc>
+qos::govern::processes()
+{
+  std::lock_guard<std::mutex> lk(g_mutex);
+
+  return g_procs;
+}
+
 std::string
 qos::govern::status()
 {
@@ -498,6 +521,12 @@ qos::govern::Stats
 qos::govern::stats()
 {
   return {false,0,0,0,0,0,0};
+}
+
+std::vector<qos::govern::Proc>
+qos::govern::processes()
+{
+  return {};
 }
 
 #endif

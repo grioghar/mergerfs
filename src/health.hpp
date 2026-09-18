@@ -48,6 +48,11 @@
 
 namespace health
 {
+  // The whole disk behind a mountpoint ("sdb", "nvme0n1"), resolved
+  // through partitions and device-mapper, or empty. Shared with the QoS
+  // stats export, which reports it beside each branch.
+  std::string resolve_disk(const std::string &mountpoint);
+
   enum class Mode
     {
      OFF,          // no monitoring

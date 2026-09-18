@@ -20,6 +20,12 @@
 
 #if USE_QOS
 
+#include "branch.hpp"
+#include "branches.hpp"
+#include "config.hpp"
+#include "fs_info.hpp"
+#include "health.hpp"
+#include "ioprio.hpp"
 #include "qos.hpp"
 #include "qos_capacity.hpp"
 #include "qos_govern.hpp"
@@ -28,6 +34,14 @@
 
 #include "fmt/core.h"
 
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <map>
+#include <mutex>
 #include <string>
 
 
@@ -71,6 +85,158 @@ namespace
   {
     return (b_ ? "true" : "false");
   }
+
+  // ---- host-side evidence beside each branch -------------------------
+  //
+  // A dashboard reading this document wants to know not just what the
+  // QoS decided but whether the decision can mean anything: an ioprio
+  // is a no-op on a disk running mq-deadline, and a branch at 95% busy
+  // explains a stall better than any class counter. All of it is read
+  // from /sys and /proc, none of it on an I/O path.
+
+  std::string
+  _read_file(const std::string &path_)
+  {
+    FILE *f = ::fopen(path_.c_str(),"r");
+    if(f == nullptr)
+      return {};
+
+    char   buf[512];
+    size_t n = ::fread(buf,1,sizeof(buf) - 1,f);
+
+    ::fclose(f);
+
+    buf[n] = '\0';
+
+    return buf;
+  }
+
+  // "[bfq]" out of "none mq-deadline [bfq]"
+  std::string
+  _scheduler(const std::string &disk_)
+  {
+    const std::string s = ::_read_file("/sys/block/" + disk_ + "/queue/scheduler");
+
+    const auto l = s.find('[');
+    const auto r = s.find(']');
+
+    if((l == std::string::npos) || (r == std::string::npos) || (r <= l))
+      return {};
+
+    return s.substr(l + 1,r - l - 1);
+  }
+
+  // Cumulative counters from /sys/block/<disk>/stat; rates are deltas
+  // between two reads of this document, which is the cadence a
+  // dashboard polls at. The first read of a disk reports zero rates.
+  struct DiskSample
+  {
+    u64 ios      = 0;   // reads + writes completed
+    u64 sectors_r = 0;
+    u64 sectors_w = 0;
+    u64 svc_ms   = 0;   // ms spent reading + writing (summed per request)
+    u64 io_ticks = 0;   // ms the queue was non-empty
+    u64 at_ns    = 0;
+  };
+
+  struct DiskRates
+  {
+    double util_pct  = 0;
+    double await_ms  = 0;
+    double read_bps  = 0;
+    double write_bps = 0;
+  };
+
+  std::mutex                       g_disk_mutex;
+  std::map<std::string,DiskSample> g_disk_prev;
+
+  u64
+  _now_ns()
+  {
+    struct timespec ts;
+
+    ::clock_gettime(CLOCK_MONOTONIC,&ts);
+
+    return ((static_cast<u64>(ts.tv_sec) * 1000000000ULL) +
+            static_cast<u64>(ts.tv_nsec));
+  }
+
+  bool
+  _disk_rates(const std::string &disk_,
+              DiskRates         *out_)
+  {
+    const std::string s = ::_read_file("/sys/block/" + disk_ + "/stat");
+    if(s.empty())
+      return false;
+
+    unsigned long long f[11] = {};
+    if(::sscanf(s.c_str(),"%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                &f[0],&f[1],&f[2],&f[3],&f[4],&f[5],&f[6],&f[7],&f[8],&f[9],&f[10]) < 11)
+      return false;
+
+    DiskSample cur;
+    cur.ios       = (f[0] + f[4]);
+    cur.sectors_r = f[2];
+    cur.sectors_w = f[6];
+    cur.svc_ms    = (f[3] + f[7]);
+    cur.io_ticks  = f[9];
+    cur.at_ns     = ::_now_ns();
+
+    std::lock_guard<std::mutex> lk(g_disk_mutex);
+
+    DiskSample &prev = g_disk_prev[disk_];
+
+    if((prev.at_ns != 0) && (cur.at_ns > prev.at_ns))
+      {
+        const double dt = (static_cast<double>(cur.at_ns - prev.at_ns) / 1e9);
+        const u64 d_ios = ((cur.ios >= prev.ios) ? (cur.ios - prev.ios) : 0);
+        const u64 d_svc = ((cur.svc_ms >= prev.svc_ms) ? (cur.svc_ms - prev.svc_ms) : 0);
+        const u64 d_tk  = ((cur.io_ticks >= prev.io_ticks) ? (cur.io_ticks - prev.io_ticks) : 0);
+
+        out_->util_pct  = std::min(100.0,(static_cast<double>(d_tk) / (dt * 1000.0)) * 100.0);
+        out_->await_ms  = (d_ios ? (static_cast<double>(d_svc) / d_ios) : 0.0);
+        out_->read_bps  = ((cur.sectors_r >= prev.sectors_r) ? (cur.sectors_r - prev.sectors_r) : 0) * 512.0 / dt;
+        out_->write_bps = ((cur.sectors_w >= prev.sectors_w) ? (cur.sectors_w - prev.sectors_w) : 0) * 512.0 / dt;
+      }
+
+    prev = cur;
+
+    return true;
+  }
+
+  // "some avg10=1.23 avg60=4.56 ..." / "full ..." from /proc/pressure/io
+  void
+  _psi_io(double *some10_, double *some60_, double *full10_, double *full60_)
+  {
+    *some10_ = *some60_ = *full10_ = *full60_ = 0.0;
+
+    const std::string s = ::_read_file("/proc/pressure/io");
+
+    const char *p = ::strstr(s.c_str(),"some avg10=");
+    if(p) ::sscanf(p,"some avg10=%lf avg60=%lf",some10_,some60_);
+    p = ::strstr(s.c_str(),"full avg10=");
+    if(p) ::sscanf(p,"full avg10=%lf avg60=%lf",full10_,full60_);
+  }
+
+  const char *
+  _mode(const Branch::Mode m_)
+  {
+    switch(m_)
+      {
+      case Branch::Mode::RO: return "RO";
+      case Branch::Mode::NC: return "NC";
+      default:               return "RW";
+      }
+  }
+
+  std::string
+  _join(const std::vector<std::string> &v_)
+  {
+    std::string out;
+    for(const auto &s : v_)
+      out += (out.empty() ? "" : "|") + s;
+    return out;
+  }
 }
 
 std::string
@@ -85,6 +251,71 @@ qos::stats_json()
   std::string out;
 
   out += "{\n";
+
+  {
+    double s10,s60,f10,f60;
+    ::_psi_io(&s10,&s60,&f10,&f60);
+
+    out += fmt::format("  \"updated\": {},\n"
+                       "  \"mount\": \"{}\",\n"
+                       "  \"daemon\": {{ \"pid\": {}, \"nice\": {}, \"ioprio\": \"{}\" }},\n"
+                       "  \"psi_io\": {{ \"some10\": {:.2f}, \"some60\": {:.2f}, "
+                       "\"full10\": {:.2f}, \"full60\": {:.2f} }},\n",
+                       static_cast<long long>(::time(nullptr)),
+                       ::_esc(cfg.mountpoint.native()),
+                       static_cast<int>(::getpid()),
+                       ::getpriority(PRIO_PROCESS,0),
+                       qos::ioprio::to_string(::ioprio::get(0)),
+                       s10,s60,f10,f60);
+  }
+
+  {
+    Branches::Ptr branches = cfg.branches;
+
+    out += fmt::format("  \"pool\": {{ \"policy_create\": \"{}\", \"minfreespace\": \"{}\", "
+                       "\"branches\": [\n",
+                       ::_esc(cfg.func.create.to_string()),
+                       ::_esc(cfg.minfreespace.to_string()));
+
+    for(std::size_t i = 0; i < branches->size(); i++)
+      {
+        const Branch     &b    = (*branches)[i];
+        const std::string path = b.path.native();
+        const std::string disk = health::resolve_disk(path);
+        DiskRates         r;
+        fs::info_t        info;
+        double            used_pct = -1;
+        u64               avail    = 0;
+
+        if(!disk.empty())
+          ::_disk_rates(disk,&r);
+
+        if(fs::info(b.path,&info) == 0)
+          {
+            const u64 total = (info.spaceavail + info.spaceused);
+            if(total)
+              used_pct = (100.0 * info.spaceused / total);
+            avail = info.spaceavail;
+          }
+
+        out += fmt::format("    {{ \"path\": \"{}\", \"mode\": \"{}\", \"accept\": \"{}\", "
+                           "\"reject\": \"{}\", \"device\": \"{}\", \"scheduler\": \"{}\", "
+                           "\"util_pct\": {:.1f}, \"await_ms\": {:.1f}, \"read_bps\": {:.0f}, "
+                           "\"write_bps\": {:.0f}, \"used_pct\": {:.1f}, \"avail_bytes\": {} }}{}\n",
+                           ::_esc(path),
+                           ::_mode(b.mode),
+                           ::_esc(::_join(b.accept)),
+                           ::_esc(::_join(b.reject)),
+                           ::_esc(disk),
+                           ::_esc(disk.empty() ? std::string{} : ::_scheduler(disk)),
+                           r.util_pct,r.await_ms,r.read_bps,r.write_bps,
+                           used_pct,
+                           static_cast<unsigned long long>(avail),
+                           ((i + 1 < branches->size()) ? "," : ""));
+      }
+
+    out += "  ] },\n";
+  }
 
   out += fmt::format("  \"enabled\": {},\n"
                      "  \"rules\": \"{}\",\n"
@@ -111,16 +342,36 @@ qos::stats_json()
   out += fmt::format("  \"calibrating\": {},\n",
                      ::_bool(qos::capacity::running()));
 
-  out += fmt::format("  \"govern\": {{ \"supported\": {}, \"interval\": {}, "
-                     "\"sweeps\": {}, \"examined\": {}, \"matched\": {}, "
-                     "\"reapplied\": {}, \"failed\": {} }},\n",
-                     ::_bool(govern.supported),
-                     govern.interval,
-                     govern.sweeps,
-                     govern.examined,
-                     govern.matched,
-                     govern.reapplied,
-                     govern.failed);
+  {
+    const auto procs = qos::govern::processes();
+
+    out += fmt::format("  \"govern\": {{ \"supported\": {}, \"interval\": {}, "
+                       "\"sweeps\": {}, \"examined\": {}, \"matched\": {}, "
+                       "\"reapplied\": {}, \"failed\": {}, \"processes\": [\n",
+                       ::_bool(govern.supported),
+                       govern.interval,
+                       govern.sweeps,
+                       govern.examined,
+                       govern.matched,
+                       govern.reapplied,
+                       govern.failed);
+
+    for(std::size_t i = 0; i < procs.size(); i++)
+      {
+        const auto &p = procs[i];
+
+        out += fmt::format("    {{ \"pid\": {}, \"comm\": \"{}\", \"class\": \"{}\", "
+                           "\"nice\": {}, \"ioprio\": \"{}\" }}{}\n",
+                           p.pid,
+                           ::_esc(p.comm),
+                           ::_esc(p.cls),
+                           ((p.nice == qos::UNSET) ? 0 : p.nice),
+                           qos::ioprio::to_string(p.ioprio),
+                           ((i + 1 < procs.size()) ? "," : ""));
+      }
+
+    out += "  ] },\n";
+  }
 
   out += fmt::format("  \"mover\": {{ \"supported\": {}, \"policy\": \"{}\", "
                      "\"state\": \"{}\", \"interval\": {}, \"high\": {}, "

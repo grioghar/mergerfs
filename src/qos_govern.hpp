@@ -55,6 +55,7 @@
 #include "qos_class.hpp"
 
 #include <string>
+#include <vector>
 
 
 namespace qos
@@ -97,5 +98,19 @@ namespace qos
     };
 
     Stats stats();
+
+    // The processes matched by a governing class at the last sweep,
+    // with the values applied to them. Bounded; a dashboard wants the
+    // handful that matter, not the host's process table.
+    struct Proc
+    {
+      int         pid;
+      std::string comm;
+      std::string cls;
+      int         nice;
+      int         ioprio;
+    };
+
+    std::vector<Proc> processes();
   }
 }

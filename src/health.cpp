@@ -329,3 +329,9 @@ health::status()
 
   return s;
 }
+
+std::string
+health::resolve_disk(const std::string &mountpoint_)
+{
+  return ::_resolve_disk(mountpoint_);
+}
