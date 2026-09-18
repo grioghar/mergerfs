@@ -56,6 +56,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -85,7 +86,8 @@ namespace
     {
      OFF,
      PERCENT_FULL,
-     TIME_BASED
+     TIME_BASED,
+     QUEUE
     };
 
   struct Settings
@@ -107,6 +109,9 @@ namespace
     u64         max_files = 0;   // per pass, 0 == unlimited
     std::string from;
     std::string to;
+    // `queue`: a file of `src|dst|lib|name` lines, each a directory
+    // tree to move whole from one branch to another, in order.
+    std::string queue;
   };
 
   struct Candidate
@@ -133,6 +138,11 @@ namespace
   u64         g_errors    = 0;
   // Files whose copy was slowed or paused by a hold.
   u64         g_holds     = 0;
+  // `queue` policy: entries in the file, entries whose source tree is
+  // gone, and the entry being worked on.
+  u64         g_queue_total = 0;
+  u64         g_queue_done  = 0;
+  std::string g_current;
   std::string g_last_error;
   std::string g_state = "idle";
 
@@ -164,6 +174,7 @@ namespace
       {
       case MoverPolicy::PERCENT_FULL: return "percent-full";
       case MoverPolicy::TIME_BASED:   return "time-based";
+      case MoverPolicy::QUEUE:        return "queue";
       default:                        return "off";
       }
   }
@@ -1005,6 +1016,342 @@ namespace
       }
   }
 
+  // ---- queue policy -------------------------------------------------
+  //
+  // An operator's list of trees to move, in order: the shape of a
+  // deliberate rebalance ("these shows off these four disks onto the
+  // new one") rather than a rule. Each line is
+  //
+  //     <src branch>|<dst branch>|<lib>|<name>
+  //
+  // and moves everything under <src>/<lib>/<name> to the same relative
+  // path on <dst>, file by file with the same safety as every other
+  // move here, then removes the emptied directories from the source.
+  // An entry is done when its source tree no longer exists, so
+  // progress needs no state file and survives restarts; the list may
+  // be edited between passes.
+
+  struct QueueEntry
+  {
+    std::string src;
+    std::string dst;
+    std::string relpath;   // lib/name
+  };
+
+  // `#` comments and blank lines are skipped. A line that does not
+  // parse is reported once per pass and skipped, never a reason to
+  // stop the rest of the list.
+  std::vector<QueueEntry>
+  _read_queue(const std::string &path_,
+              std::string       *err_)
+  {
+    std::vector<QueueEntry> out;
+    std::ifstream           in(path_);
+    std::string             line;
+
+    if(!in.good())
+      {
+        *err_ = fmt::format("queue: cannot read {}",path_);
+        return out;
+      }
+
+    while(std::getline(in,line))
+      {
+        if(line.empty() || (line[0] == '#'))
+          continue;
+
+        std::vector<std::string> f;
+        std::size_t pos = 0;
+        while(true)
+          {
+            const std::size_t bar = line.find('|',pos);
+            f.push_back(line.substr(pos,(bar == std::string::npos) ? std::string::npos : (bar - pos)));
+            if(bar == std::string::npos)
+              break;
+            pos = (bar + 1);
+          }
+
+        if((f.size() != 4) || f[0].empty() || f[1].empty() || f[2].empty() || f[3].empty() ||
+           (f[2].find('/') != std::string::npos) || (f[3].find('/') != std::string::npos) ||
+           (f[2] == "..") || (f[3] == "..") || (f[2] == ".") || (f[3] == "."))
+          {
+            if(err_->empty())
+              *err_ = fmt::format("queue: bad line: {}",line);
+            continue;
+          }
+
+        while(!f[0].empty() && (f[0].back() == '/')) f[0].pop_back();
+        while(!f[1].empty() && (f[1].back() == '/')) f[1].pop_back();
+
+        out.push_back({f[0],f[1],(f[2] + "/" + f[3])});
+      }
+
+    return out;
+  }
+
+  // Removes the empty directories under and including `relpath_` on
+  // the source, bottom up. rmdir only ever removes an empty directory,
+  // so a tree that still holds anything (a hardlinked file the mover
+  // refused, a file written since the scan) is left standing, with
+  // the entry not done, which is the right report.
+  void
+  _prune_dir(const int dirfd_)
+  {
+    const int fd = ::dup(dirfd_);
+    if(fd < 0)
+      return;
+
+    DIR *d = ::fdopendir(fd);
+    if(d == nullptr)
+      {
+        ::close(fd);
+        return;
+      }
+
+    struct dirent *de;
+    while((de = ::readdir(d)) != nullptr)
+      {
+        if((::strcmp(de->d_name,".") == 0) || (::strcmp(de->d_name,"..") == 0))
+          continue;
+
+        const int child = ::openat(dirfd_,de->d_name,
+                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if(child < 0)
+          continue;
+
+        ::_prune_dir(child);
+        ::close(child);
+        ::unlinkat(dirfd_,de->d_name,AT_REMOVEDIR);
+      }
+
+    ::closedir(d);
+  }
+
+  void
+  _prune_tree(const int          srcroot_,
+              const std::string &relpath_)
+  {
+    std::string base;
+    const int parent = fs::open_parent_beneath(srcroot_,relpath_,&base);
+    if(parent < 0)
+      return;
+
+    const int top = ::openat(parent,base.c_str(),
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if(top >= 0)
+      {
+        ::_prune_dir(top);
+        ::close(top);
+        ::unlinkat(parent,base.c_str(),AT_REMOVEDIR);
+      }
+
+    ::close(parent);
+  }
+
+  void
+  _do_queue(const Settings      &s_,
+            const Branches::Ptr &branches_)
+  {
+    std::string err;
+    const auto  entries = ::_read_queue(s_.queue,&err);
+
+    if(!err.empty())
+      {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        g_last_error = err;
+      }
+
+    // Progress first, so the report is right even when nothing below
+    // can run this pass.
+    u64 done = 0;
+    for(const auto &e : entries)
+      {
+        struct stat st;
+        if(::lstat((e.src + "/" + e.relpath).c_str(),&st) != 0)
+          done++;
+      }
+    {
+      std::lock_guard<std::mutex> lk(g_mutex);
+      g_queue_total = entries.size();
+      g_queue_done  = done;
+      g_current.clear();
+    }
+
+    u64 moved_this_pass = 0;
+
+    for(const auto &e : entries)
+      {
+        {
+          std::lock_guard<std::mutex> lk(g_mutex);
+          if(g_stop)
+            return;
+        }
+        if(s_.max_files && (moved_this_pass >= s_.max_files))
+          return;
+
+        struct stat st;
+        if(::lstat((e.src + "/" + e.relpath).c_str(),&st) != 0)
+          continue;   // done
+        if(!S_ISDIR(st.st_mode))
+          {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_skipped++;
+            g_last_error = fmt::format("{}: not a directory on {}",e.relpath,e.src);
+            continue;
+          }
+
+        Branch *src = nullptr;
+        Branch *dst = nullptr;
+        for(auto &branch : *branches_)
+          {
+            if(branch.path.native() == e.src) src = &branch;
+            if(branch.path.native() == e.dst) dst = &branch;
+          }
+        if((src == nullptr) || (dst == nullptr) || (src == dst))
+          {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_skipped++;
+            g_last_error = fmt::format("{}: {} or {} is not a branch",
+                                       e.relpath,e.src,e.dst);
+            continue;
+          }
+        if(dst->ro_or_nc())
+          {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_skipped++;
+            g_last_error = fmt::format("{}: destination {} is RO/NC",e.relpath,e.dst);
+            continue;
+          }
+        // The gate that keeps the union from placing files here applies
+        // to the mover too: a queue must not be a way around it.
+        if(dst->has_filters() && !dst->accepts("/" + e.relpath + "/"))
+          {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_skipped++;
+            g_last_error = fmt::format("{}: destination {} does not accept it",
+                                       e.relpath,e.dst);
+            continue;
+          }
+
+        const std::string srcpath = src->path.native();
+        const std::string dstpath = dst->path.native();
+
+        fs::info_t dstinfo;
+        if(fs::info(dst->path,&dstinfo) < 0)
+          continue;
+        u64 avail = dstinfo.spaceavail;
+
+        std::vector<Candidate> candidates;
+        ::_scan((srcpath + "/" + e.relpath),candidates,
+                [](const Candidate &) { return true; });
+
+        // In tree order rather than largest first: a show drains
+        // season by season, and a viewer sees a file either wholly on
+        // the old disk or wholly on the new one.
+        std::sort(candidates.begin(),candidates.end(),
+                  [](const Candidate &a_, const Candidate &b_)
+                  { return (a_.relpath < b_.relpath); });
+
+        {
+          std::lock_guard<std::mutex> lk(g_mutex);
+          g_current = e.relpath;
+        }
+        ::_set_state(fmt::format("moving {} ({} files)",e.relpath,candidates.size()));
+
+        const int srcroot = ::_open_root(srcpath);
+        if(srcroot < 0)
+          continue;
+        const int dstroot = ::_open_root(dstpath);
+        if(dstroot < 0)
+          {
+            ::close(srcroot);
+            continue;
+          }
+        struct Roots { int a, b; ~Roots() { ::close(a); ::close(b); } } roots{srcroot,dstroot};
+
+        bool clean = true;
+
+        for(const auto &c : candidates)
+          {
+            if(s_.max_files && (moved_this_pass >= s_.max_files))
+              { clean = false; break; }
+
+            {
+              std::lock_guard<std::mutex> lk(g_mutex);
+              if(g_stop)
+                return;
+            }
+
+            if(::_too_busy(s_,srcpath,dstpath))
+              {
+                ::_set_state("paused: pool busy");
+                return;
+              }
+
+            if(avail < (c.size + dst->minfreespace()))
+              {
+                std::lock_guard<std::mutex> lk(g_mutex);
+                g_skipped++;
+                g_last_error = fmt::format("{}/{}: destination needs {} free "
+                                           "(file {} + minfreespace {}), has {}",
+                                           e.relpath,c.relpath,
+                                           (c.size + dst->minfreespace()),
+                                           c.size,dst->minfreespace(),avail);
+                return;
+              }
+
+            const std::string relfile = (e.relpath + "/" + c.relpath);
+
+            if(dst->has_filters() && !dst->accepts("/" + relfile))
+              {
+                std::lock_guard<std::mutex> lk(g_mutex);
+                g_skipped++;
+                clean = false;
+                continue;
+              }
+
+            qos::note_yielding(srcpath);
+            qos::note_yielding(dstpath);
+
+            const Pace pace{&s_,&srcpath,&dstpath};
+            const int  rv = ::_move_one(srcroot,dstroot,relfile,pace);
+
+            if(rv == -EINTR)
+              return;
+
+            ::_account(rv,relfile,c.size);
+
+            // EEXIST leaves the source in place, so the tree is not
+            // clean either; the entry stays until someone resolves it.
+            if(rv < 0)
+              { clean = false; continue; }
+
+            avail -= c.size;
+            moved_this_pass++;
+          }
+
+        // Hardlinked files never became candidates, so a tree can be
+        // "clean" by this count and still hold one; rmdir then simply
+        // refuses, and the entry stays not-done. Correct either way.
+        if(clean)
+          ::_prune_tree(srcroot,e.relpath);
+
+        {
+          struct stat after;
+          if(::lstat((srcpath + "/" + e.relpath).c_str(),&after) != 0)
+            {
+              std::lock_guard<std::mutex> lk(g_mutex);
+              g_queue_done++;
+            }
+        }
+      }
+
+    {
+      std::lock_guard<std::mutex> lk(g_mutex);
+      g_current.clear();
+    }
+  }
+
   void
   _pass()
   {
@@ -1031,6 +1378,9 @@ namespace
         break;
       case MoverPolicy::TIME_BASED:
         ::_do_time_based(s,branches);
+        break;
+      case MoverPolicy::QUEUE:
+        ::_do_queue(s,branches);
         break;
       default:
         break;
@@ -1108,7 +1458,9 @@ qos::mover::configure(const std::string_view spec_)
 
   while(pos <= str.size())
     {
-      const std::size_t comma = str.find(',',pos);
+      // `;` is accepted as well as `,` so the whole specification can
+      // be given as one mount option, where commas are taken.
+      const std::size_t comma = str.find_first_of(",;",pos);
       const std::string tok   = str.substr(pos,
                                            ((comma == std::string::npos)
                                             ? std::string::npos
@@ -1133,6 +1485,8 @@ qos::mover::configure(const std::string_view spec_)
                 s.policy = MoverPolicy::PERCENT_FULL;
               else if(val == "time-based")
                 s.policy = MoverPolicy::TIME_BASED;
+              else if(val == "queue")
+                s.policy = MoverPolicy::QUEUE;
               else
                 return -EINVAL;
             }
@@ -1212,6 +1566,14 @@ qos::mover::configure(const std::string_view spec_)
             {
               s.to = val;
             }
+          else if(key == "queue")
+            {
+              // Absolute, and readable now: a typo should fail the
+              // setxattr, not surface as a silent idle mover.
+              if(val.empty() || (val[0] != '/') || (::access(val.c_str(),R_OK) != 0))
+                return -EINVAL;
+              s.queue = val;
+            }
           else
             {
               return -EINVAL;
@@ -1233,6 +1595,9 @@ qos::mover::configure(const std::string_view spec_)
     return -EINVAL;
 
   if((s.policy == MoverPolicy::TIME_BASED) && (s.from == s.to))
+    return -EINVAL;
+
+  if((s.policy == MoverPolicy::QUEUE) && s.queue.empty())
     return -EINVAL;
 
   {
@@ -1265,6 +1630,9 @@ qos::mover::stats()
           g_settings.hold_ns,
           g_settings.hold_rate,
           g_holds,
+          g_queue_total,
+          g_queue_done,
+          g_current,
           g_passes,
           g_moved,
           g_bytes,
@@ -1296,6 +1664,9 @@ qos::mover::status()
 
   if(s.policy == MoverPolicy::TIME_BASED)
     out += fmt::format("from={} to={}\n",s.from,s.to);
+  if(s.policy == MoverPolicy::QUEUE)
+    out += fmt::format("queue={} done={}/{} current={}\n",
+                       s.queue,g_queue_done,g_queue_total,g_current);
 
   out += fmt::format("state={} passes={} moved={} bytes={} skipped={} "
                      "errors={} holds={}\n",

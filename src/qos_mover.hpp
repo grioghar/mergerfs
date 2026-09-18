@@ -95,6 +95,9 @@ namespace qos
       u64         hold_ns;
       u64         hold_rate;
       u64         holds;
+      u64         queue_total;
+      u64         queue_done;
+      std::string current;
       u64         passes;
       u64         moved;
       u64         bytes;

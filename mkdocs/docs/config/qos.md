@@ -409,12 +409,13 @@ getfattr -n user.mergerfs.qos.mover --only-values /mnt/pool/.mergerfs
 
 | key | default | meaning |
 |---|---|---|
-| `policy` | `off` | `off`, `percent-full` or `time-based` |
+| `policy` | `off` | `off`, `percent-full`, `time-based` or `queue` |
 | `interval` | `60` | seconds between passes |
 | `high` | `90` | percent full at which a branch starts shedding |
 | `low` | `85` | the level the pool is being levelled towards |
 | `age` | `90` | `time-based`: days since last access |
 | `from`, `to` | - | `time-based`: source and destination branch paths |
+| `queue` | - | `queue`: path to the list of trees to move; see below |
 | `pressure` | `0.05` | pause while either end is under more backoff than this |
 | `rate` | `0` | cap, e.g. `50M`; `0` is unlimited |
 | `hold` | `0` | seconds; while a protected class has read either end this recently, pace at `hold-rate` instead |
@@ -422,7 +423,32 @@ getfattr -n user.mergerfs.qos.mover --only-values /mnt/pool/.mergerfs
 | `max-files` | `0` | per pass; `0` is unlimited |
 
 Keys not given keep their current values, so one can be adjusted
-without restating the rest.
+without restating the rest. `;` separates keys as well as `,`, which
+is what lets the whole specification be one mount option:
+`qos.mover=policy=queue;queue=/etc/mergerfs/queue.txt;hold=45s`.
+
+`queue` is the deliberate form: an operator's list of directory trees
+to move, in order, which is the shape of a real rebalance ("these
+shows off these four full disks onto the new one") rather than a rule.
+The file has one entry per line:
+
+```
+# src branch | dst branch | library | name
+/mnt/disk1|/mnt/disk5|TV|The Wire
+/mnt/disk2|/mnt/disk5|TV|Dexter
+```
+
+Everything under `<src>/<library>/<name>` moves to the same relative
+path on `<dst>`, file by file with the same safety as every other
+move, in tree order so a show drains season by season. The emptied
+directories are then removed from the source. An entry is done when
+its source tree no longer exists, so progress needs no state file,
+survives a restart, and the list can be edited between passes. A tree
+holding a hardlinked file (which the mover refuses to split) keeps its
+entry not-done, which is the correct report. The destination's
+`accept`/`reject` patterns apply to the mover as they do to the union:
+a queue is not a way around them. `qos.mover` reports `done=n/m` and
+the entry currently moving.
 
 The mover's I/O does not pass through the FUSE path, so a class rule
 cannot slow it; `hold` and `hold-rate` are the same rule applied to

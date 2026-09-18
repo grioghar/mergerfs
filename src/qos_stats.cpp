@@ -399,6 +399,7 @@ qos::stats_json()
                      "\"state\": \"{}\", \"interval\": {}, \"high\": {}, "
                      "\"low\": {}, \"pressure\": {:.2f}, \"rate\": {}, "
                      "\"hold_s\": {}, \"hold_rate\": {}, \"holds\": {}, "
+                     "\"queue_total\": {}, \"queue_done\": {}, \"current\": \"{}\", "
                      "\"passes\": {}, \"moved\": {}, \"bytes\": {}, "
                      "\"skipped\": {}, \"errors\": {}, "
                      "\"last_error\": \"{}\" }},\n",
@@ -413,6 +414,9 @@ qos::stats_json()
                      (mover.hold_ns / 1000000000ULL),
                      mover.hold_rate,
                      mover.holds,
+                     mover.queue_total,
+                     mover.queue_done,
+                     ::_esc(mover.current),
                      mover.passes,
                      mover.moved,
                      mover.bytes,
