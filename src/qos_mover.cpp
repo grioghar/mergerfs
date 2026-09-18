@@ -320,6 +320,21 @@ namespace
   // write to, is a "delete any file on the host" primitive: swap a
   // directory in the chain for a symlink to /etc between the scan and
   // the unlink.
+  // A pass must end promptly when the mover is stopped OR when the
+  // operator turns the policy off or changes it while a pass runs. A
+  // queue of terabytes cannot wait for the pass to run out of work
+  // before `policy=off` means anything -- measured 2026-09-18: a pass
+  // ignored the pause for the rest of its list. Checked between files
+  // and between chunks; the file in flight completes or is abandoned
+  // by the ordinary error path, never left half-moved.
+  bool
+  _interrupted(const MoverPolicy running_)
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+
+    return (g_stop || (g_settings.policy != running_));
+  }
+
   // Which resources a move touches, for pacing it against playback.
   struct Pace
   {
@@ -393,18 +408,17 @@ namespace
                 // second, and abandoned at once on stop.
                 std::unique_lock<std::mutex> lk(g_mutex);
 
+                const MoverPolicy running = pace_.s->policy;
                 if(g_cv.wait_for(lk,std::chrono::milliseconds(500),
-                                 []{ return g_stop; }))
+                                 [running]{ return (g_stop || (g_settings.policy != running)); }))
                   return -EINTR;
 
                 continue;
               }
           }
-        else
+        else if(pace_.s && ::_interrupted(pace_.s->policy))
           {
-            std::lock_guard<std::mutex> lk(g_mutex);
-            if(g_stop)
-              return -EINTR;
+            return -EINTR;
           }
 
         if(rate != paced_rate)
@@ -484,8 +498,9 @@ namespace
               {
                 std::unique_lock<std::mutex> lk(g_mutex);
 
+                const MoverPolicy running = (pace_.s ? pace_.s->policy : MoverPolicy::OFF);
                 if(g_cv.wait_for(lk,std::chrono::nanoseconds(want_ns - elapsed),
-                                 []{ return g_stop; }))
+                                 [running]{ return (g_stop || (g_settings.policy != running)); }))
                   return -EINTR;
               }
           }
@@ -823,11 +838,8 @@ namespace
         if(s_.max_files && (moved >= s_.max_files))
           break;
 
-        {
-          std::lock_guard<std::mutex> lk(g_mutex);
-          if(g_stop)
-            return;
-        }
+        if(::_interrupted(s_.policy))
+          return;
 
         if(::_too_busy(s_,srcpath,dstpath))
           {
@@ -970,11 +982,8 @@ namespace
         if(s_.max_files && (moved >= s_.max_files))
           break;
 
-        {
-          std::lock_guard<std::mutex> lk(g_mutex);
-          if(g_stop)
-            return;
-        }
+        if(::_interrupted(s_.policy))
+          return;
 
         if(::_too_busy(s_,srcpath,dstpath))
           {
@@ -1181,11 +1190,8 @@ namespace
 
     for(const auto &e : entries)
       {
-        {
-          std::lock_guard<std::mutex> lk(g_mutex);
-          if(g_stop)
-            return;
-        }
+        if(::_interrupted(s_.policy))
+          return;
         if(s_.max_files && (moved_this_pass >= s_.max_files))
           return;
 
@@ -1276,11 +1282,8 @@ namespace
             if(s_.max_files && (moved_this_pass >= s_.max_files))
               { clean = false; break; }
 
-            {
-              std::lock_guard<std::mutex> lk(g_mutex);
-              if(g_stop)
-                return;
-            }
+            if(::_interrupted(s_.policy))
+              return;
 
             if(::_too_busy(s_,srcpath,dstpath))
               {

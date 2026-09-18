@@ -85,6 +85,17 @@ SUM_AFTER=$(cd $T/pool && find TV Movies -type f -print0 | sort -z | xargs -0 md
 [ "$SUM_BEFORE" = "$SUM_AFTER" ] && ok "every file byte-identical through the pool" || bad "content" "checksums differ"
 get qos.stats.json | grep -o '"mover": {[^}]*}' | grep -o '"queue_total[^,]*, "queue_done[^,]*, "current[^,]*'
 
+echo "== policy=off interrupts a running pass =="
 set_ qos.mover "policy=off" >/dev/null
+mk "$T/br1/TV/Show E/big.mkv" 48
+printf '%s\n' "$T/br1|$T/br2|TV|Show E" > $T/queue2.txt
+set_ qos.mover "policy=queue,queue=$T/queue2.txt,interval=1,pressure=1.0,rate=4M" >/dev/null
+sleep 3
+get qos.mover | grep -q "state=moving" && ok "pass running (48MiB at 4MiB/s)" || bad "pass" "not running: $(get qos.mover | grep state)"
+set_ qos.mover "policy=off" >/dev/null
+for i in 1 2 3 4 5 6; do get qos.mover | grep -q "state=idle" && break; sleep 0.5; done
+get qos.mover | grep -q "state=idle" && ok "pass stopped within 3s of policy=off" || bad "interrupt" "$(get qos.mover | grep state)"
+[ -f "$T/br1/TV/Show E/big.mkv" ] && ok "in-flight source left intact" || bad "source" "gone"
+[ -z "$(find $T/br2 -name '.mergerfs-mover.*')" ] && ok "no temp file left on destination" || bad "temp" "$(find $T/br2 -name '.mergerfs-mover.*')"
 echo
 [ $FAILED = 0 ] && echo "ALL OK" || { echo "FAILURES"; exit 1; }
