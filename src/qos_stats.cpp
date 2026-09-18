@@ -398,6 +398,7 @@ qos::stats_json()
   out += fmt::format("  \"mover\": {{ \"supported\": {}, \"policy\": \"{}\", "
                      "\"state\": \"{}\", \"interval\": {}, \"high\": {}, "
                      "\"low\": {}, \"pressure\": {:.2f}, \"rate\": {}, "
+                     "\"hold_s\": {}, \"hold_rate\": {}, \"holds\": {}, "
                      "\"passes\": {}, \"moved\": {}, \"bytes\": {}, "
                      "\"skipped\": {}, \"errors\": {}, "
                      "\"last_error\": \"{}\" }},\n",
@@ -409,6 +410,9 @@ qos::stats_json()
                      mover.low,
                      mover.pressure,
                      mover.rate,
+                     (mover.hold_ns / 1000000000ULL),
+                     mover.hold_rate,
+                     mover.holds,
                      mover.passes,
                      mover.moved,
                      mover.bytes,
@@ -421,10 +425,19 @@ qos::stats_json()
     {
       const auto &r = resources[i];
 
+      // Age of the last protected request, in ms; null if there has
+      // never been one. A consumer compares it with a class's hold_s
+      // to see whether that class is currently held on this resource.
+      const std::string protected_age =
+        ((r.protected_age_ns == UINT64_MAX)
+         ? std::string("null")
+         : std::to_string(r.protected_age_ns / 1000000ULL));
+
       out += fmt::format("    {{ \"name\": \"{}\", \"contended\": {}, "
                          "\"pressure\": {:.2f}, \"observed_bps\": {}, "
                          "\"probed_bps\": {}, \"latency_ms\": {:.1f}, "
-                         "\"baseline_ms\": {:.1f}, \"distress_events\": {} }}{}\n",
+                         "\"baseline_ms\": {:.1f}, \"distress_events\": {}, "
+                         "\"protected_age_ms\": {} }}{}\n",
                          ::_esc(r.name),
                          ::_bool(r.contended),
                          r.pressure,
@@ -433,6 +446,7 @@ qos::stats_json()
                          (static_cast<double>(r.latency_ewma_ns) / 1000000.0),
                          (static_cast<double>(r.latency_base_ns) / 1000000.0),
                          r.distress_events,
+                         protected_age,
                          ((i + 1 < resources.size()) ? "," : ""));
     }
   out += "  ],\n";
@@ -444,18 +458,21 @@ qos::stats_json()
 
       out += fmt::format("    {{ \"name\": \"{}\", \"protect\": {}, "
                          "\"critical\": {}, \"govern\": {}, \"yield\": {}, "
+                         "\"hold_s\": {}, "
                          "\"requests\": {}, \"bytes\": {}, \"throttled\": {}, "
-                         "\"throttled_ms\": {}, \"passed\": {} }}{}\n",
+                         "\"throttled_ms\": {}, \"passed\": {}, \"held\": {} }}{}\n",
                          ::_esc(c.name),
                          ::_bool(c.protect),
                          ::_bool(c.critical),
                          ::_bool(c.govern),
                          c.yield,
+                         (c.hold_ns / 1000000000ULL),
                          c.requests,
                          c.bytes,
                          c.throttled,
                          (c.throttled_ns / (1000 * 1000)),
                          c.passed,
+                         c.held,
                          ((i + 1 < classes.size()) ? "," : ""));
     }
   out += "  ]\n";

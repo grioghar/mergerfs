@@ -514,11 +514,40 @@ RuleSet::parse(const std::string_view text_,
                       return fail(fmt::format("invalid floor '{}'",val));
                     }
                 }
+              else if(key == "hold")
+                {
+                  // Seconds, with an optional unit: 45, 45s, 2m.
+                  std::string num = val;
+                  u64         mult = 1;
+                  if(!num.empty() && ((num.back() == 's') || (num.back() == 'm')))
+                    {
+                      mult = ((num.back() == 'm') ? 60 : 1);
+                      num.pop_back();
+                    }
+                  char *end = nullptr;
+                  const unsigned long n = ::strtoul(num.c_str(),&end,10);
+                  if(num.empty() || (end == num.c_str()) || (*end != '\0') ||
+                     (n == 0) || ((n * mult) > 3600))
+                    return fail(fmt::format("hold must be 1s-3600s: '{}'",val));
+                  cls->hold_ns = (static_cast<u64>(n) * mult * 1000000000ULL);
+                }
               else
                 {
                   return fail(fmt::format("unknown class key '{}'",key));
                 }
             }
+
+          // A held class is slowed to its floor, never stopped, so a
+          // hold without a floor would be a stop by another name.
+          // Refused at parse time rather than silently resolving to a
+          // byte per second at runtime.
+          if(cls->holds() && !cls->floor && !cls->floor_pct)
+            return fail(fmt::format("class '{}': hold= requires floor=",
+                                    cls->name));
+          if(cls->holds() && cls->immune())
+            return fail(fmt::format("class '{}': hold= on a {} class does nothing",
+                                    cls->name,
+                                    (cls->protect ? "protect" : "critical")));
 
           // A bucket with no explicit depth holds one second of
           // traffic, which is enough to absorb a readahead burst
@@ -716,7 +745,7 @@ RuleSet::to_string() const
   for(const auto &c : _classes)
     {
       s += fmt::format("class {}{}{}{} ioprio={} nice={} rate={} burst={} "
-                       "yield={} floor={}{}{}\n",
+                       "yield={} floor={}{}{}{}\n",
                        c->name,
                        (c->protect ? " protect" : ""),
                        (c->critical ? " critical" : ""),
@@ -733,6 +762,9 @@ RuleSet::to_string() const
                         : std::string{}),
                        ((c->govern_nice != qos::UNSET)
                         ? fmt::format(" govern-nice={}",c->govern_nice)
+                        : std::string{}),
+                       (c->holds()
+                        ? fmt::format(" hold={}s",(c->hold_ns / 1000000000ULL))
                         : std::string{}));
     }
 

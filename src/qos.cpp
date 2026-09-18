@@ -584,7 +584,10 @@ qos::resources()
                     contended,
                     g->latency_ewma,
                     g->latency_base,
-                    g->distress_events});
+                    g->distress_events,
+                    ((g->protected_at && (now >= g->protected_at))
+                     ? (now - g->protected_at)
+                     : UINT64_MAX)});
     }
 
   return rv;
@@ -613,7 +616,9 @@ qos::class_stats()
                     c->protect,
                     c->critical,
                     c->govern,
-                    c->yield});
+                    c->yield,
+                    c->hold_ns,
+                    c->held.load(std::memory_order_relaxed)});
     }
 
   return rv;
@@ -649,7 +654,9 @@ namespace
     g_->yielding_at = now;
   }
 
-  double _pressure(qos::Governor *g_);
+  // `hold_ns_` is the calling class's hold window; `*held_` reports
+  // whether a protected class touched the resource within it.
+  double _pressure(qos::Governor *g_, const u64 hold_ns_ = 0, bool *held_ = nullptr);
 }
 
 void
@@ -664,16 +671,43 @@ qos::pressure(const std::string &resource_)
   return ::_pressure(::_governor_for(resource_));
 }
 
+u64
+qos::protected_age_ns(const std::string &resource_)
+{
+  qos::Governor *g = ::_governor_for(resource_);
+  const u64 now = ::_now_ns();
+
+  std::lock_guard<std::mutex> lk(g->mutex);
+
+  if((g->protected_at == 0) || (now < g->protected_at))
+    return UINT64_MAX;
+
+  return (now - g->protected_at);
+}
+
 namespace
 {
 double
-_pressure(qos::Governor *g)
+_pressure(qos::Governor *g,
+          const u64      hold_ns_,
+          bool          *held_)
 {
   const u64 now = ::_now_ns();
 
   std::lock_guard<std::mutex> lk(g->mutex);
 
   const double gpu_floor = qos::gpu::pressure_floor();
+
+  // The hold is judged on the same timestamp the contention window
+  // uses, just over a longer span: the calling class is held for
+  // `hold_ns_` after the last protected request, however the latency
+  // loop feels about it. Computed under the one lock so the answer
+  // and the pressure are from the same instant.
+  if(held_ != nullptr)
+    *held_ = ((hold_ns_ != 0) &&
+              (g->protected_at != 0) &&
+              (now >= g->protected_at) &&
+              ((now - g->protected_at) <= hold_ns_));
 
   // Nobody has been streaming off this resource lately, so there is
   // nothing to protect and nothing to yield to -- unless the video
@@ -786,9 +820,10 @@ qos::throttle(const Apply        &apply_,
 
       ::_note_yielding(gov);
 
-      const double p = ::_pressure(gov);
+      bool         held = false;
+      const double p    = ::_pressure(gov,cls->hold_ns,&held);
 
-      if(p <= 0.0)
+      if(!held && (p <= 0.0))
         {
           // Nothing protected is reading this resource, so a yielding
           // class runs at whatever it was configured for -- which for
@@ -798,27 +833,49 @@ qos::throttle(const Apply        &apply_,
         }
       else
         {
-          // Scaling needs a number to scale. An otherwise unlimited
-          // class is measured against the resource's capacity; with no
-          // capacity declared there is nothing to compute against and
-          // it stays unlimited.
-              const u64 base = (rate ? rate : rs->capacity(resource_,measured));
-
-          if(base == 0)
-            return;
-
-          const double share = (1.0 - ((p * cls->yield) / 100.0));
-          u64 scaled = static_cast<u64>(base * std::max(0.0,share));
-
-          // Yielding must never mean stopping: a floored class keeps
-          // making progress, just slowly.
           const u64 floor = rs->floor_for(cls,resource_,measured);
-          if(scaled < floor)
-            scaled = floor;
-          if(scaled == 0)
-            scaled = 1;
 
-          rate = scaled;
+          if(held && (floor != 0))
+            {
+              // Playback (or whatever is protected) has read this disk
+              // within the class's hold window: down to the floor,
+              // whatever the latency loop currently measures.
+              cls->held.fetch_add(1,std::memory_order_relaxed);
+              rate = floor;
+            }
+          else if(cls->yield == 0)
+            {
+              // A hold-only class whose floor is a percentage of a
+              // capacity nobody has measured yet. Unlimited until one
+              // is known, rather than stopped: the parser refused a
+              // hold with no floor for the same reason.
+              if(rate == 0)
+                return;
+            }
+          else
+            {
+              // Scaling needs a number to scale. An otherwise
+              // unlimited class is measured against the resource's
+              // capacity; with no capacity declared there is nothing
+              // to compute against and it stays unlimited.
+              const double pp   = (held ? 1.0 : p);
+              const u64    base = (rate ? rate : rs->capacity(resource_,measured));
+
+              if(base == 0)
+                return;
+
+              const double share  = (1.0 - ((pp * cls->yield) / 100.0));
+              u64          scaled = static_cast<u64>(base * std::max(0.0,share));
+
+              // Yielding must never mean stopping: a floored class
+              // keeps making progress, just slowly.
+              if(scaled < floor)
+                scaled = floor;
+              if(scaled == 0)
+                scaled = 1;
+
+              rate = scaled;
+            }
         }
     }
 
@@ -1039,14 +1096,15 @@ qos::stats()
   for(const auto &c : rs->classes())
     {
       out += fmt::format("{}: requests={} bytes={} throttled={} "
-                         "throttled-ms={} passed={}\n",
+                         "throttled-ms={} passed={} held={}\n",
                          c->name,
                          c->requests.load(std::memory_order_relaxed),
                          c->bytes.load(std::memory_order_relaxed),
                          c->throttled.load(std::memory_order_relaxed),
                          (c->throttled_ns.load(std::memory_order_relaxed) /
                           (1000 * 1000)),
-                         c->passed.load(std::memory_order_relaxed));
+                         c->passed.load(std::memory_order_relaxed),
+                         c->held.load(std::memory_order_relaxed));
     }
 
   return out;
@@ -1067,6 +1125,7 @@ qos::reset_stats()
       c->throttled.store(0,std::memory_order_relaxed);
       c->throttled_ns.store(0,std::memory_order_relaxed);
       c->passed.store(0,std::memory_order_relaxed);
+      c->held.store(0,std::memory_order_relaxed);
     }
 }
 

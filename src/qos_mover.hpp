@@ -92,6 +92,9 @@ namespace qos
       u64         low;
       double      pressure;
       u64         rate;
+      u64         hold_ns;
+      u64         hold_rate;
+      u64         holds;
       u64         passes;
       u64         moved;
       u64         bytes;

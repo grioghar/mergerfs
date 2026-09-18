@@ -38,6 +38,14 @@ namespace fs
            const struct stat &src_st,
            const int          dst_fd);
 
+  // Everything copyfile() does after the data: xattrs, attrs,
+  // ownership, mode, times. For a caller that has copied the bytes
+  // itself.
+  s64
+  copyfile_metadata(const int          src_fd,
+                    const struct stat &src_st,
+                    const int          dst_fd);
+
   s64
   copyfile(const int            src_fd,
            const fs::path      &dst_filepath,

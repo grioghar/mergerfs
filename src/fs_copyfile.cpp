@@ -68,6 +68,16 @@ fs::copyfile(const int          src_fd_,
   if(rv < 0)
     return rv;
 
+  return fs::copyfile_metadata(src_fd_,src_st_,dst_fd_);
+}
+
+s64
+fs::copyfile_metadata(const int          src_fd_,
+                      const struct stat &src_st_,
+                      const int          dst_fd_)
+{
+  s64 rv;
+
   rv = fs::xattr::copy(src_fd_,dst_fd_);
   if((rv < 0) && !::_ignorable_error(-rv))
     return rv;

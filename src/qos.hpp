@@ -47,6 +47,7 @@
 #include "fuse_req_ctx.h"
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -101,6 +102,7 @@ namespace qos
                        std::atomic<void*> * = nullptr) {}
 
   inline double pressure(const std::string &) { return 0.0; }
+  inline u64    protected_age_ns(const std::string &) { return UINT64_MAX; }
   inline void   note_yielding(const std::string &) {}
   inline u64    measured_capacity(const std::string &) { return 0; }
   inline void   set_probed_capacity(const std::string &, const u64) {}
@@ -194,6 +196,12 @@ namespace qos
   // flat out on a disk nobody is streaming from.
   double pressure(const std::string &resource);
 
+  // Nanoseconds since a protected class last issued I/O against the
+  // resource, or UINT64_MAX if it never has. This is the signal a
+  // `hold` is measured against, exposed for the mover, which does its
+  // I/O outside the FUSE path and so never passes through throttle().
+  u64 protected_age_ns(const std::string &resource);
+
   // ---- capacity -----------------------------------------------------
   //
   // What the daemon believes `resource` can deliver, in bytes/sec, or
@@ -233,6 +241,8 @@ namespace qos
     u64         latency_ewma_ns;
     u64         latency_base_ns;
     u64         distress_events;
+    // UINT64_MAX when no protected class has ever touched it.
+    u64         protected_age_ns;
   };
 
   std::vector<ResourceInfo> resources();
@@ -252,6 +262,8 @@ namespace qos
     bool        critical;
     bool        govern;
     u32         yield;
+    u64         hold_ns;
+    u64         held;
   };
 
   std::vector<ClassInfo> class_stats();

@@ -25,7 +25,10 @@
 #include "branch.hpp"
 #include "branches.hpp"
 #include "config.hpp"
+#include "fs_copy_file_range.hpp"
 #include "fs_copyfile.hpp"
+#include "fs_fadvise.hpp"
+#include "fs_ficlone.hpp"
 #include "fs_file_unchanged.hpp"
 #include "fs_info.hpp"
 #include "fs_open_beneath.hpp"
@@ -94,6 +97,13 @@ namespace
     u64         age_days  = 90;
     double      pressure  = 0.05;
     u64         rate      = 0;   // bytes/sec, 0 == unlimited
+    // While a protected class has read either end of a move within
+    // `hold_ns`, the copy is paced at `hold_rate` instead of `rate`
+    // (0 == wait, not copy). The same rule a class carries as
+    // `hold=`, applied to the daemon's own bulk traffic, which never
+    // passes through throttle().
+    u64         hold_ns   = 0;
+    u64         hold_rate = (20ULL * 1024 * 1024);
     u64         max_files = 0;   // per pass, 0 == unlimited
     std::string from;
     std::string to;
@@ -121,6 +131,8 @@ namespace
   u64         g_bytes     = 0;
   u64         g_skipped   = 0;
   u64         g_errors    = 0;
+  // Files whose copy was slowed or paused by a hold.
+  u64         g_holds     = 0;
   std::string g_last_error;
   std::string g_state = "idle";
 
@@ -297,10 +309,185 @@ namespace
   // write to, is a "delete any file on the host" primitive: swap a
   // directory in the chain for a symlink to /etc between the scan and
   // the unlink.
+  // Which resources a move touches, for pacing it against playback.
+  struct Pace
+  {
+    const Settings    *s;
+    const std::string *src;
+    const std::string *dst;
+  };
+
+  constexpr u64 COPY_CHUNK = (8ULL << 20);
+
+  // True while a protected class has read either end within the hold
+  // window.
+  bool
+  _held(const Pace &p_)
+  {
+    if((p_.s == nullptr) || (p_.s->hold_ns == 0))
+      return false;
+
+    return ((qos::protected_age_ns(*p_.src) <= p_.s->hold_ns) ||
+            (qos::protected_age_ns(*p_.dst) <= p_.s->hold_ns));
+  }
+
+  // Copies the data in chunks, re-deciding the rate between chunks.
+  //
+  // Whole-file pacing (copy, then sleep off the difference) cannot
+  // react to playback that starts partway through a 20GB file, and
+  // that is exactly the case that matters: the copy is what makes the
+  // stream stutter, and it has to slow *now*. The host-side governors
+  // this replaces got that reaction from a cgroup io.max on the copy's
+  // process; here the copy is our own loop, so it simply asks between
+  // chunks.
+  //
+  // Returns bytes copied, or -errno. -EINTR when the mover is being
+  // stopped.
+  s64
+  _paced_copy(const int          src_fd_,
+              const struct stat &st_,
+              const int          dst_fd_,
+              const Pace        &pace_,
+              bool              *was_held_)
+  {
+    // A reflink is free and instant: nothing to pace.
+    if(fs::ficlone(src_fd_,dst_fd_) >= 0)
+      return st_.st_size;
+
+    const u64 total = static_cast<u64>(st_.st_size);
+
+    fs::fadvise_sequential(src_fd_,0,total);
+
+    u64  done        = 0;
+    u64  paced_rate  = 0;   // the rate the current stretch is paced at
+    u64  paced_start = 0;
+    u64  paced_bytes = 0;
+    bool use_cfr     = true;
+
+    *was_held_ = false;
+
+    while(done < total)
+      {
+        // ---- decide the rate for this chunk ----
+        u64 rate = pace_.s ? pace_.s->rate : 0;
+
+        if(::_held(pace_))
+          {
+            *was_held_ = true;
+            rate = pace_.s->hold_rate;
+
+            if(rate == 0)
+              {
+                // Wait it out rather than crawl: re-checked every half
+                // second, and abandoned at once on stop.
+                std::unique_lock<std::mutex> lk(g_mutex);
+
+                if(g_cv.wait_for(lk,std::chrono::milliseconds(500),
+                                 []{ return g_stop; }))
+                  return -EINTR;
+
+                continue;
+              }
+          }
+        else
+          {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            if(g_stop)
+              return -EINTR;
+          }
+
+        if(rate != paced_rate)
+          {
+            paced_rate  = rate;
+            paced_start = ::_now_ns();
+            paced_bytes = 0;
+          }
+
+        // ---- copy one chunk ----
+        const u64 want = std::min<u64>(COPY_CHUNK,total - done);
+        s64       rv;
+
+        if(use_cfr)
+          {
+            s64 off_in  = static_cast<s64>(done);
+            s64 off_out = static_cast<s64>(done);
+
+            rv = fs::copy_file_range(src_fd_,&off_in,dst_fd_,&off_out,want,0);
+            if((rv == -EINTR) || (rv == -EAGAIN))
+              continue;
+            if(rv < 0)
+              {
+                // Not supported across these filesystems on this
+                // kernel: fall back for the rest of the file.
+                use_cfr = false;
+                continue;
+              }
+            if(rv == 0)
+              return -EIO;   // shorter than fstat said
+          }
+        else
+          {
+            static thread_local std::vector<char> buf;
+            if(buf.size() < COPY_CHUNK)
+              buf.resize(COPY_CHUNK);
+
+            rv = ::pread(src_fd_,buf.data(),want,static_cast<off_t>(done));
+            if(rv < 0)
+              {
+                if(errno == EINTR)
+                  continue;
+                return -errno;
+              }
+            if(rv == 0)
+              return -EIO;
+
+            s64 wdone = 0;
+            while(wdone < rv)
+              {
+                const s64 w = ::pwrite(dst_fd_,buf.data() + wdone,
+                                       (rv - wdone),
+                                       static_cast<off_t>(done + wdone));
+                if(w < 0)
+                  {
+                    if(errno == EINTR)
+                      continue;
+                    return -errno;
+                  }
+                wdone += w;
+              }
+          }
+
+        done        += static_cast<u64>(rv);
+        paced_bytes += static_cast<u64>(rv);
+
+        // ---- sleep off what this stretch is ahead of its rate ----
+        if(paced_rate != 0)
+          {
+            const u64 now     = ::_now_ns();
+            const u64 elapsed = ((now > paced_start) ? (now - paced_start) : 0);
+            const u64 want_ns =
+              static_cast<u64>((static_cast<unsigned __int128>(paced_bytes) *
+                                NS_PER_SEC) / paced_rate);
+
+            if(want_ns > elapsed)
+              {
+                std::unique_lock<std::mutex> lk(g_mutex);
+
+                if(g_cv.wait_for(lk,std::chrono::nanoseconds(want_ns - elapsed),
+                                 []{ return g_stop; }))
+                  return -EINTR;
+              }
+          }
+      }
+
+    return static_cast<s64>(done);
+  }
+
   int
   _move_one(const int          srcroot_,
             const int          dstroot_,
-            const std::string &relpath_)
+            const std::string &relpath_,
+            const Pace        &pace_)
   {
     s64         rv;
     std::string base;
@@ -377,8 +564,20 @@ namespace
         return err_;
       };
 
-    // Data, xattrs, attrs, ownership, mode, times -- onto the fd.
-    rv = fs::copyfile(src_fd,st,dst_fd);
+    // Data first, paced against playback; then xattrs, attrs,
+    // ownership, mode, times -- all onto the fd.
+    bool was_held = false;
+    rv = ::_paced_copy(src_fd,st,dst_fd,pace_,&was_held);
+    if(rv < 0)
+      return abandon(static_cast<int>(rv));
+
+    if(was_held)
+      {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        g_holds++;
+      }
+
+    rv = fs::copyfile_metadata(src_fd,st,dst_fd);
     if(rv < 0)
       return abandon(static_cast<int>(rv));
 
@@ -665,9 +864,11 @@ namespace
         qos::note_yielding(srcpath);
         qos::note_yielding(dstpath);
 
-        const u64 t0 = ::_now_ns();
-        const int rv = ::_move_one(srcroot,dstroot,c.relpath);
-        const u64 elapsed = (::_now_ns() - t0);
+        const Pace pace{&s_,&srcpath,&dstpath};
+        const int  rv = ::_move_one(srcroot,dstroot,c.relpath,pace);
+
+        if(rv == -EINTR)
+          return;
 
         ::_account(rv,c.relpath,c.size);
 
@@ -680,30 +881,8 @@ namespace
         dst->spaceavail -= c.size;
         budget          -= std::min(budget,c.size);
 
-        // An explicit rate cap, on top of idle priority and the
-        // pressure gate. Sleeping for the time the copy "should" have
-        // taken is crude, but it is the only lever that works when the
-        // destination is fast enough that nothing ever registers as
-        // contended.
-        //
-        // The wait is on the condition variable rather than a plain
-        // sleep so that shutdown does not have to wait out a pacing
-        // delay sized for a 20GB file.
-        if(s_.rate != 0)
-          {
-            const u64 want_ns =
-              static_cast<u64>((static_cast<unsigned __int128>(c.size) *
-                                NS_PER_SEC) / s_.rate);
-
-            if(want_ns > elapsed)
-              {
-                std::unique_lock<std::mutex> lk(g_mutex);
-
-                g_cv.wait_for(lk,
-                              std::chrono::nanoseconds(want_ns - elapsed),
-                              []{ return g_stop; });
-              }
-          }
+        // Pacing, including the explicit rate cap, happens inside the
+        // copy now, chunk by chunk; see _paced_copy.
       }
   }
 
@@ -810,7 +989,11 @@ namespace
         qos::note_yielding(srcpath);
         qos::note_yielding(dstpath);
 
-        const int rv = ::_move_one(srcroot,dstroot,c.relpath);
+        const Pace pace{&s_,&srcpath,&dstpath};
+        const int  rv = ::_move_one(srcroot,dstroot,c.relpath,pace);
+
+        if(rv == -EINTR)
+          return;
 
         ::_account(rv,c.relpath,c.size);
 
@@ -994,6 +1177,26 @@ qos::mover::configure(const std::string_view spec_)
               if(qos::parse_size(val,&s.rate))
                 return -EINVAL;
             }
+          else if(key == "hold")
+            {
+              std::string num  = val;
+              u64         mult = 1;
+              if(!num.empty() && ((num.back() == 's') || (num.back() == 'm')))
+                {
+                  mult = ((num.back() == 'm') ? 60 : 1);
+                  num.pop_back();
+                }
+              const unsigned long n = ::strtoul(num.c_str(),&end,10);
+              if(num.empty() || (end == num.c_str()) || (*end != '\0') ||
+                 ((n * mult) > 3600))
+                return -EINVAL;
+              s.hold_ns = (static_cast<u64>(n) * mult * NS_PER_SEC);
+            }
+          else if(key == "hold-rate")
+            {
+              if(qos::parse_size(val,&s.hold_rate))
+                return -EINVAL;
+            }
           else if(key == "max-files")
             {
               const unsigned long n = ::strtoul(val.c_str(),&end,10);
@@ -1059,6 +1262,9 @@ qos::mover::stats()
           g_settings.low,
           g_settings.pressure,
           g_settings.rate,
+          g_settings.hold_ns,
+          g_settings.hold_rate,
+          g_holds,
           g_passes,
           g_moved,
           g_bytes,
@@ -1076,7 +1282,7 @@ qos::mover::status()
 
   std::string out =
     fmt::format("policy={} interval={} high={} low={} age={} "
-                "pressure={:.2f} rate={} max-files={}\n",
+                "pressure={:.2f} rate={} hold={}s hold-rate={} max-files={}\n",
                 ::_policy_name(s.policy),
                 s.interval,
                 s.high,
@@ -1084,19 +1290,22 @@ qos::mover::status()
                 s.age_days,
                 s.pressure,
                 s.rate,
+                (s.hold_ns / NS_PER_SEC),
+                s.hold_rate,
                 s.max_files);
 
   if(s.policy == MoverPolicy::TIME_BASED)
     out += fmt::format("from={} to={}\n",s.from,s.to);
 
   out += fmt::format("state={} passes={} moved={} bytes={} skipped={} "
-                     "errors={}\n",
+                     "errors={} holds={}\n",
                      g_state,
                      g_passes,
                      g_moved,
                      g_bytes,
                      g_skipped,
-                     g_errors);
+                     g_errors,
+                     g_holds);
 
   if(!g_last_error.empty())
     out += fmt::format("last-error={}\n",g_last_error);

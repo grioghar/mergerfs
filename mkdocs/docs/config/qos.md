@@ -99,6 +99,7 @@ wins. A class must be defined before a rule names it.
 | `critical` | never throttled, and *not* a control signal |
 | `yield=` | `0`-`100`: how hard this class gives way under pressure |
 | `floor=` | never back off below this; absolute or a percentage |
+| `hold=` | seconds; stay at `floor` on a resource for this long after a protected class last read it; see [Holding for playback](#holding-for-playback) |
 | `govern` | also apply this class's values to the client process itself; see [The process governor](#the-process-governor) |
 | `govern-ioprio=`, `govern-nice=` | what the governor applies to the *process*, when that should differ from what its pool I/O gets; default to `ioprio` / `nice` |
 
@@ -247,6 +248,44 @@ On an SSD or NVMe pool it will never be reached and the governor will
 never engage -- use single-digit milliseconds there. Setting it to `0`
 removes noise suppression entirely and is not recommended.
 
+### Holding for playback
+
+The latency loop reacts to harm already done: a stutter has to be
+measured before anything gives way. For traffic that is known to hurt
+-- a library scan sweeping the disk someone is watching from -- there
+is a blunter rule that acts on presence rather than pain:
+
+```
+class scanning  yield=60 floor=10% hold=45s ioprio=be:6 nice=10
+```
+
+While a protected class has read a resource within the last `hold`
+seconds, this class is held at its `floor` on that resource, whatever
+the latency loop currently measures. The window is a grace period: a
+player with a full buffer issues no reads for seconds at a time, and a
+stream that is buffering may issue none at all, so the hold outlasts
+the last read rather than lapsing with it. A stream that has been
+paused issues no reads either, and the hold lapses on its own once
+the window passes -- it is judged by bytes moving, not by files held
+open.
+
+Per resource, like everything else: a scanner walking a disk nobody is
+playing from is not held on account of playback elsewhere.
+
+`hold` requires a `floor`. A held class is slowed to its floor, never
+stopped, and the parser refuses a hold that would have nothing to slow
+to. This is deliberate, and it is the difference between this and the
+host-side governors it replaces, which SIGSTOP the scanner outright:
+a stopped scanner that shares a database lock with the media server
+stalls the very playback it was stopped for. Slowed, it finishes its
+transaction and yields on the next read.
+
+The `held` counter in `qos.stats` is the number of requests served at
+the floor for this reason; `protected_age_ms` on each resource in
+`qos.stats.json` is how long ago the last protected read arrived,
+which compared with a class's `hold_s` says whether it is held there
+right now.
+
 
 ## The process governor
 
@@ -378,10 +417,18 @@ getfattr -n user.mergerfs.qos.mover --only-values /mnt/pool/.mergerfs
 | `from`, `to` | - | `time-based`: source and destination branch paths |
 | `pressure` | `0.05` | pause while either end is under more backoff than this |
 | `rate` | `0` | cap, e.g. `50M`; `0` is unlimited |
+| `hold` | `0` | seconds; while a protected class has read either end this recently, pace at `hold-rate` instead |
+| `hold-rate` | `20M` | the rate while held; `0` waits rather than copies |
 | `max-files` | `0` | per pass; `0` is unlimited |
 
 Keys not given keep their current values, so one can be adjusted
 without restating the rest.
+
+The mover's I/O does not pass through the FUSE path, so a class rule
+cannot slow it; `hold` and `hold-rate` are the same rule applied to
+the mover directly. The copy is paced chunk by chunk, re-deciding the
+rate every 8MiB, so playback that starts partway through a 20GB file
+slows the copy within a chunk rather than after the file.
 
 `percent-full` moves the largest files off the fullest branch onto the
 emptiest one that has room, stopping when the source reaches `low` *or*
@@ -446,8 +493,9 @@ class playback  protect ioprio=rt:0 nice=-5
 class helpers   critical
 
 # A media server's own background work -- scans, thumbnails, chapter
-# and credits detection -- yields, but gently.
-class scanning  yield=60  floor=10% ioprio=be:6 nice=10
+# and credits detection -- yields, but gently; and is held at its
+# floor on any disk that has been played from in the last 45s.
+class scanning  yield=60  floor=10% hold=45s ioprio=be:6 nice=10
 
 # Downloads yield first and hardest, but never stop. `govern` also
 # pins the downloader's own process to the bottom of both schedulers,

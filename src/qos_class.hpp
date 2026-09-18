@@ -257,8 +257,29 @@ namespace qos
     u64 floor     = 0;
     u32 floor_pct = 0;
 
+    // Hold this class at its floor on a resource for this long after a
+    // protected class last issued I/O there. Zero means off.
+    //
+    // This is the "playback wins, and keeps winning until it has been
+    // quiet for a while" rule that host-side governors implement by
+    // polling /proc and SIGSTOPping the competition. The daemon serves
+    // the protected reads itself, so it knows the moment one arrives
+    // and needs no polling; and because the hold slows the class to
+    // its floor rather than freezing the process, nothing that shares
+    // a lock with the protected client (a scanner writing the same
+    // library database as the server) can be left stopped mid
+    // transaction. A paused stream issues no reads, so the hold lapses
+    // on its own; the window is the grace that a buffering stream gets
+    // before the class is let back up.
+    //
+    // Per resource, like everything else here: a scanner walking a
+    // disk nobody is playing from is not held on account of playback
+    // elsewhere.
+    u64 hold_ns = 0;
+
     bool limited() const { return ((rate != 0) || (pct != 0)); }
-    bool adaptive() const { return (yield != 0); }
+    bool adaptive() const { return ((yield != 0) || (hold_ns != 0)); }
+    bool holds() const { return (hold_ns != 0); }
 
   public:
     // Buckets are created on first use and keyed by resource name
@@ -278,5 +299,7 @@ namespace qos
     mutable std::atomic<u64> throttled{0};
     mutable std::atomic<u64> throttled_ns{0};
     mutable std::atomic<u64> passed{0};
+    // Requests served at the floor because of `hold`.
+    mutable std::atomic<u64> held{0};
   };
 }
